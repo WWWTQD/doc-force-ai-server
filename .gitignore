@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+venv/
+
+# Environment
+.env
+
+# IntelliJ IDEA
+.idea/
+*.iml
+
+# AI models
+models/
+*.pth
+*.pt
+*.onnx
+*.safetensors
+
+# Upload/output
+uploads/
+outputs/
+
+# OS
+.DS_Store
+Thumbs.db
