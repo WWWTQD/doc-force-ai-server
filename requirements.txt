@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+python-multipart
+opencv-python
+numpy
+Pillow
+pytesseract
+pytest
+httpx
+pydantic
+pydantic-settings
+python-dotenv
+pytest-asyncio

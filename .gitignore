@@ -23,6 +23,15 @@ models/
 # Upload/output
 uploads/
 outputs/
+data/input/
+data/output/
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+
 
 # OS
 .DS_Store
