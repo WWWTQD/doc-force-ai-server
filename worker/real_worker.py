@@ -7,14 +7,14 @@ Tích hợp OpenCV ImagePreprocessor và PaddleOCR (hoặc OCREngine)
 Vòng lặp:
   1. POST /api/worker/jobs/claim
   2. Nếu job type == "OCR":
-       - Tải ảnh gốc: GET /api/worker/jobs/{id}/pages/{pageId}/original
+       - Tải ảnh gốc: GET /api/worker/jobs/{id}/pages/{pageId}/original  (+ X-Lease-Token)
        - Tiền xử lý (OpenCV Deskew, Denoise, CLAHE)
        - Nhận dạng chữ bằng OCREngine (PaddleOCR)
        - POST /api/worker/jobs/{id}/results
   3. Nếu job type == "EXPORT":
-       - Tải snapshot JSON: GET /api/worker/jobs/{id}/export-snapshot
+       - Tải snapshot JSON: GET /api/worker/jobs/{id}/snapshot           (+ X-Lease-Token)
        - Render file .docx bằng python-docx (hoặc export engine)
-       - POST /api/worker/jobs/{id}/export-artifact
+       - POST /api/worker/jobs/{id}/artifact                             (+ X-Lease-Token)
        - POST /api/worker/jobs/{id}/complete
   4. Heartbeat tự động trong thread riêng.
 """
@@ -70,32 +70,37 @@ signal.signal(signal.SIGTERM, _signal_handler)
 signal.signal(signal.SIGINT, _signal_handler)
 
 
-def _headers(content_type: str = "application/json"):
+def _base_headers(lease_token: str | None = None) -> dict:
+    """Headers chung cho mọi request: xác thực worker + tuỳ chọn lease token."""
     h = {"X-Worker-Key": WORKER_SECRET_KEY}
-    if content_type:
-        h["Content-Type"] = content_type
+    if lease_token:
+        h["X-Lease-Token"] = lease_token
     return h
 
 
-def _post(path: str, payload: dict, timeout: int = 15) -> dict | None:
+def _post(path: str, payload: dict, timeout: int = 15, lease_token: str | None = None) -> dict | None:
     url = f"{BACKEND_URL}{path}"
-    resp = requests.post(url, json=payload, headers=_headers(), timeout=timeout)
+    headers = _base_headers(lease_token)
+    headers["Content-Type"] = "application/json"
+    resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
     if resp.status_code == 204:
         return None
     resp.raise_for_status()
     return resp.json()
 
 
-def _get_bytes(path: str, timeout: int = 30) -> bytes:
+def _get_bytes(path: str, lease_token: str, timeout: int = 30) -> bytes:
+    """Tải bytes (ảnh gốc) — bắt buộc truyền lease_token."""
     url = f"{BACKEND_URL}{path}"
-    resp = requests.get(url, headers=_headers(content_type=None), timeout=timeout)
+    resp = requests.get(url, headers=_base_headers(lease_token), timeout=timeout)
     resp.raise_for_status()
     return resp.content
 
 
-def _get_json(path: str, timeout: int = 15) -> dict:
+def _get_json(path: str, lease_token: str, timeout: int = 15) -> dict:
+    """Tải JSON (snapshot) — bắt buộc truyền lease_token."""
     url = f"{BACKEND_URL}{path}"
-    resp = requests.get(url, headers=_headers(content_type=None), timeout=timeout)
+    resp = requests.get(url, headers=_base_headers(lease_token), timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 
@@ -155,7 +160,11 @@ def _process_ocr_job(job: dict, preprocessor: ImagePreprocessor, ocr_engine: OCR
             page_number = page["pageNumber"]
             LOG.info("  -> Tải ảnh gốc trang %d/%d (pageId=%s)...", idx, len(pages), page_id)
 
-            image_bytes = _get_bytes(f"/api/worker/jobs/{job_id}/pages/{page_id}/original")
+            # FIX: truyền lease_token theo đúng X-Lease-Token header
+            image_bytes = _get_bytes(
+                f"/api/worker/jobs/{job_id}/pages/{page_id}/original",
+                lease_token=lease_token,
+            )
 
             # 1. Preprocess
             LOG.info("  -> Đang tiền xử lý ảnh (OpenCV Deskew, Denoise, CLAHE)...")
@@ -176,7 +185,7 @@ def _process_ocr_job(job: dict, preprocessor: ImagePreprocessor, ocr_engine: OCR
             LOG.warning("  Mất heartbeat — bỏ qua gửi kết quả job %s", job_id)
             return
 
-        # Gửi kết quả về backend
+        # Gửi kết quả OCR về backend qua /results
         _post(
             f"/api/worker/jobs/{job_id}/results",
             {
@@ -205,27 +214,29 @@ def _process_export_job(job: dict):
     heartbeat.start()
 
     try:
-        # Tải snapshot JSON từ backend
+        # FIX: path /snapshot (không phải /export-snapshot) + truyền X-Lease-Token
         LOG.info("  -> Tải export snapshot JSON từ Backend...")
-        snapshot = _get_json(f"/api/worker/jobs/{job_id}/export-snapshot")
+        snapshot = _get_json(f"/api/worker/jobs/{job_id}/snapshot", lease_token=lease_token)
 
         # Tạo file DOCX bằng python-docx
         docx_bytes = _generate_docx_from_snapshot(snapshot)
 
-        # Upload artifact file lên backend
+        # FIX: path /artifact (không phải /export-artifact) + X-Lease-Token header
         LOG.info("  -> Upload DOCX artifact (%d bytes)...", len(docx_bytes))
-        url = f"{BACKEND_URL}/api/worker/jobs/{job_id}/export-artifact"
+        url = f"{BACKEND_URL}/api/worker/jobs/{job_id}/artifact"
         files = {"file": ("document.docx", docx_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")}
-        headers = {"X-Worker-Key": WORKER_SECRET_KEY}
+        headers = _base_headers(lease_token)  # bao gồm cả X-Lease-Token
         resp = requests.post(url, files=files, headers=headers, timeout=30)
         resp.raise_for_status()
+        artifact_data = resp.json()
+        artifact_key = artifact_data.get("storageKey")
 
-        # Gọi complete job
+        # Gọi /complete để hoàn tất export job
         _post(
             f"/api/worker/jobs/{job_id}/complete",
             {
                 "leaseToken": lease_token,
-                "exportStorageKey": None,
+                "exportStorageKey": artifact_key,
                 "pipelineVersion": "docx-exporter-v1.0",
             },
         )
@@ -312,7 +323,7 @@ def _try_fail(job_id: str, lease_token: str, error_code: str, error_message: str
 
 def main():
     LOG.info("╔══════════════════════════════════════╗")
-    LOG.info("║   Doc Forge — Real AI Worker v1.0    ║")
+    LOG.info("║   Doc Forge — Real AI Worker v1.1    ║")
     LOG.info("╚══════════════════════════════════════╝")
     LOG.info("Backend URL  : %s", BACKEND_URL)
     LOG.info("Worker ID    : %s", WORKER_INSTANCE_ID)
