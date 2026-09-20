@@ -42,6 +42,7 @@ These are examples and should be kept out of Git.
   - data/output/
   - uploads/
   - outputs/
+  - firmware/
 
 - Local AI / debug files
   - LOCAL_AI_STATUS.md
