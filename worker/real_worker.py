@@ -32,6 +32,14 @@ from dotenv import load_dotenv
 from preprocessor import ImagePreprocessor
 from ocr_engine import OCREngine
 
+try:
+    from ultralytics import YOLO
+except ImportError:
+    class _DummyYOLO:
+        def __init__(self, path):
+            self.path = path
+    YOLO = _DummyYOLO
+
 # Cài đặt python-docx nếu có
 DOCX_AVAILABLE = False
 try:
@@ -331,6 +339,9 @@ def main():
 
     preprocessor = ImagePreprocessor()
     ocr_engine = OCREngine(lang="vi")
+
+    # Khởi tạo mô hình AI (YOLO)
+    model = YOLO("models/best.pt")
 
     consecutive_errors = 0
 
