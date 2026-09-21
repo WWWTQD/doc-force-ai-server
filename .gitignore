@@ -25,6 +25,8 @@ uploads/
 outputs/
 data/input/
 data/output/
+# Firmware (may contain WiFi credentials/device keys)
+firmware/
 
 # VS Code
 .vscode/
