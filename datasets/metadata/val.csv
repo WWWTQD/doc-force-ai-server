@@ -1,0 +1,4 @@
+input,target,source_id,degradation,blur_level,blur_type,kernel_size,sigma
+datasets/images/synthetic/blur/Anh5_blur_light.jpg,datasets/images/original/Anh5.jpg,Anh5,blur,light,gaussian,5,0.924
+datasets/images/synthetic/blur/Anh5_blur_medium.jpg,datasets/images/original/Anh5.jpg,Anh5,blur,medium,gaussian,7,1.807
+datasets/images/synthetic/blur/Anh5_blur_strong.jpg,datasets/images/original/Anh5.jpg,Anh5,blur,strong,motion,13,

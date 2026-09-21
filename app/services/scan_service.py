@@ -81,11 +81,46 @@ class ScanService:
         )
 
         # ============================================================
-        # 6. OCR
+        # 6. PP-StructureV3 & OCR Extraction
         # ============================================================
-        ocr_res = self.ocr_service.extract_text_from_bytes(
-            processed_bytes
-        )
+        structure_results = None
+        engine = None
+        try:
+            from app.services.structure_engine import StructureEngine
+            engine = StructureEngine.get_instance()
+        except Exception:
+            pass
+
+        if engine and engine.initialized:
+            try:
+                # Run prediction on saved image path
+                structure_results = engine.predict(input_path)
+            except Exception as e:
+                logger.warning(f"PP-StructureV3 prediction failed during scan: {e}")
+
+        # Extract text from PP-StructureV3 if available, else fallback to pytesseract
+        ocr_res = None
+        if structure_results:
+            full_text_list = []
+            scores = []
+            for page in structure_results:
+                ocr_info = page.get("overall_ocr_res", {})
+                rec_texts = ocr_info.get("rec_texts", [])
+                rec_scores = ocr_info.get("rec_scores", [])
+                if rec_texts:
+                    full_text_list.extend(rec_texts)
+                    scores.extend(rec_scores)
+            
+            if full_text_list:
+                avg_conf = float(sum(scores) / len(scores)) if scores else 0.85
+                ocr_res = {
+                    "text": "\n".join(full_text_list),
+                    "confidence": avg_conf,
+                    "language": "vie+eng"
+                }
+
+        if not ocr_res:
+            ocr_res = self.ocr_service.extract_text_from_bytes(processed_bytes)
 
         # ============================================================
         # 7. Detect defects (include OCR results)
@@ -98,7 +133,7 @@ class ScanService:
         )
 
         # ============================================================
-        # 7. Save processed image
+        # 8. Save processed image and raw PP-Structure output
         # ============================================================
         processed_filename = f"{scan_id}_processed.jpg"
 
@@ -122,6 +157,14 @@ class ScanService:
             "wb"
         ) as f:
             f.write(processed_bytes)
+
+        if structure_results:
+            try:
+                raw_pp_path = os.path.join(out_dir, f"{scan_id}_ppstructure.json")
+                with open(raw_pp_path, "w", encoding="utf-8") as f:
+                    json.dump(structure_results, f, ensure_ascii=False, indent=2, default=str)
+            except Exception as ex:
+                logger.warning(f"Could not save raw PP-Structure output: {ex}")
 
         # ============================================================
         # 8. Build response models

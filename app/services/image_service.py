@@ -14,7 +14,7 @@ from app.core.exceptions import (
 )
 
 
-ALLOWED_EXT = {"jpg", "jpeg", "png", "tiff", "bmp"}
+ALLOWED_EXT = {"jpg", "jpeg", "png", "webp", "tiff", "bmp"}
 
 
 class ImageService:
@@ -23,6 +23,21 @@ class ImageService:
     Validates size, basic MIME/format, and attempts to decode with OpenCV.
     Saves original bytes to `data/input/{scan_id}.{ext}` and returns path and bytes.
     """
+
+    def decode_image_bytes(self, content: bytes) -> np.ndarray:
+        """Decodes raw byte array into an OpenCV BGR image numpy ndarray."""
+        if not content:
+            raise InvalidImageError("Uploaded image content is empty")
+        try:
+            arr = np.frombuffer(content, np.uint8)
+            img_cv = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img_cv is None:
+                raise InvalidImageError("OpenCV failed to decode image")
+            return img_cv
+        except InvalidImageError:
+            raise
+        except Exception as e:
+            raise InvalidImageError(f"Failed to decode image with OpenCV: {e}")
 
     async def validate_and_save(self, scan_id: str, upload_file) -> Tuple[str, bytes]:
         # read bytes
@@ -48,15 +63,7 @@ class ImageService:
             raise UnsupportedFormatError(f"Format {format_name} is not supported")
 
         # try decode with OpenCV to ensure valid image bytes
-        try:
-            arr = np.frombuffer(content, np.uint8)
-            img_cv = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img_cv is None:
-                raise InvalidImageError("OpenCV failed to decode image")
-        except InvalidImageError:
-            raise
-        except Exception:
-            raise InvalidImageError("OpenCV failed to decode image")
+        self.decode_image_bytes(content)
 
         # save to data/input with UUID filename (avoid user filename)
         ext = format_name if format_name != "jpeg" else "jpg"

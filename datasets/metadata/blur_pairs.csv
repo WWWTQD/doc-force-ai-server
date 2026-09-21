@@ -1,0 +1,16 @@
+input,target,source_id,degradation,blur_level,blur_type,kernel_size,sigma
+datasets/images/synthetic/blur/Anh1_blur_light.jpg,datasets/images/original/Anh1.jpg,Anh1,blur,light,gaussian,3,0.513
+datasets/images/synthetic/blur/Anh1_blur_medium.jpg,datasets/images/original/Anh1.jpg,Anh1,blur,medium,gaussian,7,1.245
+datasets/images/synthetic/blur/Anh1_blur_strong.jpg,datasets/images/original/Anh1.jpg,Anh1,blur,strong,gaussian,7,2.677
+datasets/images/synthetic/blur/Anh2_blur_light.jpg,datasets/images/original/Anh2.jfif,Anh2,blur,light,gaussian,3,0.795
+datasets/images/synthetic/blur/Anh2_blur_medium.jpg,datasets/images/original/Anh2.jfif,Anh2,blur,medium,gaussian,5,1.03
+datasets/images/synthetic/blur/Anh2_blur_strong.jpg,datasets/images/original/Anh2.jfif,Anh2,blur,strong,gaussian,7,2.561
+datasets/images/synthetic/blur/Anh3_blur_light.jpg,datasets/images/original/Anh3.jfif,Anh3,blur,light,gaussian,5,0.61
+datasets/images/synthetic/blur/Anh3_blur_medium.jpg,datasets/images/original/Anh3.jfif,Anh3,blur,medium,gaussian,7,1.809
+datasets/images/synthetic/blur/Anh3_blur_strong.jpg,datasets/images/original/Anh3.jfif,Anh3,blur,strong,gaussian,7,2.698
+datasets/images/synthetic/blur/Anh4_blur_light.jpg,datasets/images/original/Anh4.jfif,Anh4,blur,light,gaussian,5,0.639
+datasets/images/synthetic/blur/Anh4_blur_medium.jpg,datasets/images/original/Anh4.jfif,Anh4,blur,medium,gaussian,5,1.957
+datasets/images/synthetic/blur/Anh4_blur_strong.jpg,datasets/images/original/Anh4.jfif,Anh4,blur,strong,gaussian,7,2.38
+datasets/images/synthetic/blur/Anh5_blur_light.jpg,datasets/images/original/Anh5.jpg,Anh5,blur,light,gaussian,5,0.924
+datasets/images/synthetic/blur/Anh5_blur_medium.jpg,datasets/images/original/Anh5.jpg,Anh5,blur,medium,gaussian,7,1.807
+datasets/images/synthetic/blur/Anh5_blur_strong.jpg,datasets/images/original/Anh5.jpg,Anh5,blur,strong,motion,13,
