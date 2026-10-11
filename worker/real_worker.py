@@ -341,7 +341,19 @@ def main():
     ocr_engine = OCREngine(lang="vi")
 
     # Khởi tạo mô hình AI (YOLO)
-    model = YOLO("models/best.pt")
+    model_path = os.path.join(os.path.dirname(__file__), "models", "best.pt")
+    if not os.path.exists(model_path):
+        model_path = "models/best.pt"
+    try:
+        if os.path.exists(model_path):
+            model = YOLO(model_path)
+            LOG.info("Khởi tạo YOLO model thành công tại %s", model_path)
+        else:
+            model = None
+            LOG.warning("Không tìm thấy YOLO model tại %s, tiếp tục không có YOLO standalone.", model_path)
+    except Exception as e:
+        model = None
+        LOG.warning("Lỗi khởi tạo YOLO: %s", e)
 
     consecutive_errors = 0
 
