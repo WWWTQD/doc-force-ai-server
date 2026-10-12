@@ -5,9 +5,17 @@ __pycache__/
 # Virtual environment
 .venv/
 venv/
+.venv*/
 
 # Environment
 .env
+.env.*
+!.env.example
+
+# Evaluation and temporary files
+eval_reports/
+eval_results/
+my_dataset_backup/
 
 # IntelliJ IDEA
 .idea/
