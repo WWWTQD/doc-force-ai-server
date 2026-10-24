@@ -1,0 +1,15 @@
+# Dependencies for Document Restoration AI Training Pipeline (U-Net)
+# Python 3.10+ / 3.11 recommended
+
+# PyTorch & Torchvision (CPU or CUDA variant depending on system)
+# For CUDA: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Image processing & Computer Vision
+opencv-python>=4.8.0
+pillow>=10.0.0
+numpy>=1.24.0
+
+# Testing & Validation
+pytest>=8.0.0

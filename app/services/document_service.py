@@ -1,78 +1,130 @@
 import cv2
 import numpy as np
 import io
+import logging
 from PIL import Image
-from typing import Dict
+from typing import Dict, Any
 from app.cv import rotation_detector
+from app.services.yolo_service import YOLOService
+
+logger = logging.getLogger(__name__)
 
 
 class DocumentService:
-    """Detects document region and provides helper to extract/correct perspective."""
+    """
+    Detects document region using deep learning YOLO model and performs perspective extraction.
+    """
 
-    def detect_document_from_bytes(self, data: bytes) -> Dict:
+    def __init__(self):
+        self.yolo_service = YOLOService()
+
+    def detect_document_from_bytes(self, data: bytes) -> Dict[str, Any]:
+        """
+        Detects document using YOLO model as primary detector.
+        If YOLO does not detect document, returns detected=False without OpenCV fallback.
+        """
         try:
             img = Image.open(io.BytesIO(data)).convert("RGB")
             arr = np.array(img)
-            gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            edged = cv2.Canny(blurred, 75, 200)
-            contours, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-            contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
-            for c in contours:
-                peri = cv2.arcLength(c, True)
-                approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-                if len(approx) == 4:
-                    pts = approx.reshape(4, 2)
-                    # order points consistently
-                    ordered = self._order_points(pts)
-                    # naive confidence based on area
-                    area = cv2.contourArea(approx)
-                    img_area = arr.shape[0] * arr.shape[1]
-                    confidence = min(1.0, max(0.0, area / img_area))
-                    # bounding box
-                    x, y, w_box, h_box = cv2.boundingRect(approx)
-                    bounding_box = {"x": int(x), "y": int(y), "width": int(w_box), "height": int(h_box)}
-                    # attempt rotation detection via pytesseract if available
-                    rotation_info = rotation_detector.detect_rotation(Image.fromarray(arr))
+
+            # Primary detector: YOLO model
+            yolo_result = self.yolo_service.detect_document(img)
+
+            if yolo_result.get("detected") and yolo_result.get("corners"):
+                corners = yolo_result["corners"]
+                bounding_box = yolo_result["bounding_box"]
+                confidence = yolo_result["confidence"]
+
+                # Rotation detection
+                rotation = 0
+                try:
+                    rotation_info = rotation_detector.detect_rotation(img)
                     rotation = int(rotation_info.get("rotation", 0)) if rotation_info else 0
-                    return {
-                        "detected": True,
-                        "confidence": float(confidence),
-                        "corners": ordered.tolist(),
-                        "bounding_box": bounding_box,
-                        "rotation": rotation,
-                        "skew_angle": 0.0,
-                    }
-            return {"detected": False, "confidence": 0.0, "corners": [], "rotation": 0, "skew_angle": 0.0}
-        except Exception:
-            return {"detected": False, "confidence": 0.0, "corners": [], "rotation": 0, "skew_angle": 0.0}
+                except Exception as ex:
+                    logger.debug("Rotation detection skipped: %s", ex)
+
+                return {
+                    "detected": True,
+                    "confidence": float(confidence),
+                    "corners": corners,
+                    "bounding_box": bounding_box,
+                    "rotation": rotation,
+                    "skew_angle": 0.0,
+                    "model": "YOLOv8-Doc",
+                    "checkpoint": yolo_result.get("checkpoint"),
+                    "inference_time_ms": yolo_result.get("inference_time_ms", 0.0),
+                }
+
+            # No document detected by YOLO
+            logger.info("Document not detected by YOLO in uploaded image.")
+            return {
+                "detected": False,
+                "confidence": 0.0,
+                "corners": [],
+                "bounding_box": None,
+                "rotation": 0,
+                "skew_angle": 0.0,
+                "model": "YOLOv8-Doc",
+                "checkpoint": yolo_result.get("checkpoint"),
+                "inference_time_ms": yolo_result.get("inference_time_ms", 0.0),
+            }
+
+        except Exception as e:
+            logger.exception("Error during document detection: %s", e)
+            return {
+                "detected": False,
+                "confidence": 0.0,
+                "corners": [],
+                "bounding_box": None,
+                "rotation": 0,
+                "skew_angle": 0.0,
+            }
 
     def extract_document_bytes(self, data: bytes, doc_info: Dict) -> bytes:
-        # If corners available, perform perspective transform and return JPEG bytes
+        """
+        Crops and applies perspective transformation on the document region detected by YOLO.
+        """
         try:
             img = Image.open(io.BytesIO(data)).convert("RGB")
             arr = np.array(img)
+
             if doc_info.get("detected") and doc_info.get("corners"):
                 pts = np.array(doc_info["corners"], dtype="float32")
-                # order points: top-left, top-right, bottom-right, bottom-left
                 rect = self._order_points(pts)
                 (tl, tr, br, bl) = rect
+
                 widthA = np.linalg.norm(br - bl)
                 widthB = np.linalg.norm(tr - tl)
                 maxWidth = max(int(widthA), int(widthB))
+
                 heightA = np.linalg.norm(tr - br)
                 heightB = np.linalg.norm(tl - bl)
                 maxHeight = max(int(heightA), int(heightB))
-                dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
-                M = cv2.getPerspectiveTransform(rect, dst)
-                warped = cv2.warpPerspective(arr, M, (maxWidth, maxHeight))
-                pil = Image.fromarray(warped)
+
+                if maxWidth > 10 and maxHeight > 10:
+                    dst = np.array(
+                        [
+                            [0, 0],
+                            [maxWidth - 1, 0],
+                            [maxWidth - 1, maxHeight - 1],
+                            [0, maxHeight - 1],
+                        ],
+                        dtype="float32",
+                    )
+                    M = cv2.getPerspectiveTransform(rect, dst)
+                    warped = cv2.warpPerspective(arr, M, (maxWidth, maxHeight))
+                    pil = Image.fromarray(warped)
+                else:
+                    pil = img
             else:
                 pil = img
+
             buf = io.BytesIO()
-            pil.save(buf, format="JPEG")
+            pil.save(buf, format="JPEG", quality=95)
             return buf.getvalue()
-        except Exception:
+
+        except Exception as e:
+            logger.warning("Failed to extract document bytes: %s. Returning original image.", e)
             return data
 
     def _order_points(self, pts: np.ndarray) -> np.ndarray:
@@ -84,4 +136,3 @@ class DocumentService:
         rect[1] = pts[np.argmin(diff)]
         rect[3] = pts[np.argmax(diff)]
         return rect
-

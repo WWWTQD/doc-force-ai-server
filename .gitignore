@@ -9,17 +9,36 @@ venv/
 
 # Environment
 .env
+.env.*
+.env.local_backup
+
+# Archives & Large Colab datasets
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
 
 # IntelliJ IDEA
 .idea/
 *.iml
 
 # AI models
-models/
+models/*
 *.pth
 *.pt
 *.onnx
 *.safetensors
+!models/restoration_best.pth
+!models/README.md
+!models/training_log.json
+
+# Datasets raw images (only keep metadata & README)
+datasets/images/
+datasets/original/
+datasets/processed/
+datasets/real/
+datasets/synthetic/
 
 # Upload/output
 uploads/
@@ -33,10 +52,9 @@ data/output/
 # Logs
 *.log
 
-
 # OS
+.DS_Store
+Thumbs.db
 
 # Local AI reference (not for GitHub)
 LOCAL_AI_STATUS.md
-.DS_Store
-Thumbs.db

@@ -207,7 +207,11 @@ Pipeline xử lý End-to-End được tích hợp trong ứng dụng như sau:
 
 **Trạng thái triển khai từng bước**:
 - Bước 1, 2, 4, 5, 6: **Đã triển khai hoàn chỉnh** trong ứng dụng chính (`app/services/structure_engine.py`, `structure_parser.py`, `docx_exporter.py`).
-- Bước 3 (Document Restoration UNet): **Đã triển khai dưới dạng mô-đun độc lập và script thử nghiệm** (`training/test_restoration.py`, `inference_real.py`).
+- Bước 3 (Document Restoration UNet): **Đã triển khai thành pipeline độc lập chuẩn hóa trong `training/`** (`training/train_restoration.py`, `training/evaluate_restoration.py`, `training/infer_restoration.py`).
+
+> **Cập nhật hiện trạng Dataset & Pipeline (Branch `vanh_backup`):**
+> - **Cấu trúc `training/` đã được tinh gọn**: Giữ lại 6 module nòng cốt (`train_restoration.py`, `restoration_dataset.py`, `evaluate_restoration.py`, `infer_restoration.py`, `generate_blur_dataset.py`, `split_dataset.py`). Toàn bộ 19 script thử nghiệm OCR/debug cũ được chuyển vào `archive/training_experiments/`.
+> - **Tình trạng Dataset thực tế**: Hiện tại có **0/15 cặp ảnh hợp lệ** trên đĩa do ảnh trong `datasets/images/` đã bị xóa trong working tree; các thư mục `datasets/processed/*`, `datasets/synthetic/*`, `datasets/original/`, `datasets/real/` đang rỗng. Loader đã được nâng cấp cảnh báo số lượng cặp thiếu file.
 
 ---
 
@@ -229,22 +233,22 @@ Pipeline xử lý End-to-End được tích hợp trong ứng dụng như sau:
 
 ### Experiment 3: Đánh giá Định lượng Model Phục hồi trên Tập Test
 - **Mục tiêu**: Đo lường sự cải thiện chỉ số PSNR, SSIM trên tập test độc lập (`test.csv`: 3 ảnh `Anh1`).
-- **Script**: `training/test_restoration.py`.
+- **Script**: `training/evaluate_restoration.py` *(trước đây là `test_restoration.py`)*.
 - **Output**: Tạo thư mục kết quả `outputs/restoration/test/`, ảnh so sánh `outputs/restoration/comparison/` và file JSON metric `outputs/restoration/test_metrics.json`.
 - **Trạng thái**: **Hoàn thành**.
 
 ### Experiment 4: Thử nghiệm Phục hồi trên Ảnh Blur Thực tế (Real World)
 - **Mục tiêu**: Đánh giá khả năng tổng quát hóa của model trên dữ liệu tài liệu thực tế.
 - **Input**: 6 ảnh tài liệu mờ trong `datasets/images/real/blur/`.
-- **Script**: `training/inference_real.py`.
+- **Script**: `training/infer_restoration.py` *(trước đây là `inference_real.py`)*.
 - **Output**: 6 ảnh phục hồi tại `outputs/restoration_real/` và 6 ảnh contact-sheet so sánh tại `outputs/restoration_real/comparison/`.
 - **Trạng thái**: **Hoàn thành**.
 
 ### Experiment 5: Chạy PP-StructureV3 trích xuất OCR trên Ảnh đã Phục hồi
 - **Mục tiêu**: Kiểm tra xem ảnh sau phục hồi có nâng cao độ chính xác nhận diện văn bản của PP-StructureV3 hay không.
-- **Script**: `training/run_structure_anh1_final.py`, `scripts/process_dataset_ppstructure.py`.
+- **Script**: `archive/training_experiments/run_structure_anh1_final.py`, `scripts/process_dataset_ppstructure.py`.
 - **Output**: File JSON kết quả `outputs/ppstructure_anh1_results/sample.json`.
-- **Trạng thái**: **Hoàn thành**.
+- **Trạng thái**: **Hoàn thành** *(Script thử nghiệm đã lưu vào archive)*.
 
 ---
 
