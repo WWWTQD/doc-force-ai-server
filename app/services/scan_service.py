@@ -17,6 +17,8 @@ from app.services.ocr_service import OCRService
 from app.services.quality_service import QualityService
 from app.services.document_service import DocumentService
 from app.services.defect_service import DefectService
+from app.services.restoration_service import RestorationService
+from app.core.config import settings
 
 from app.core.logging import Timer
 
@@ -33,8 +35,9 @@ class ScanService:
         2. Detect document
         3. Analyze image quality
         4. Detect defects
-        5. Extract / preprocess document
-        6. OCR
+        5. Extract / perspective dewarp document
+        5.1 Restore image with DocumentRestorationUNet
+        6. OCR / PP-StructureV3
         7. Save processed image
         8. Build and save scan result
     """
@@ -45,6 +48,7 @@ class ScanService:
         self.quality_service = QualityService()
         self.document_service = DocumentService()
         self.defect_service = DefectService()
+        self.restoration_service = RestorationService.get_instance()
 
     async def process_scan(self, scan_id: str, upload_file) -> ScanResult:
         timer = Timer()
@@ -81,6 +85,30 @@ class ScanService:
         )
 
         # ============================================================
+        # 5.1 Document Image Restoration (DocumentRestorationUNet)
+        # ============================================================
+        if settings.ENABLE_IMAGE_RESTORATION:
+            try:
+                processed_bytes = self.restoration_service.restore_image_bytes(
+                    processed_bytes,
+                    tile_size=settings.RESTORATION_TILE_SIZE,
+                    overlap=settings.RESTORATION_OVERLAP,
+                    preserve_color=settings.RESTORATION_PRESERVE_COLOR,
+                )
+            except Exception as ex:
+                logger.warning(
+                    "Document restoration failed: %s. Proceeding with cropped image.", ex
+                )
+
+        # Save processed/restored image
+        processed_filename = f"{scan_id}_processed.jpg"
+        out_dir = os.path.join("data", "output")
+        os.makedirs(out_dir, exist_ok=True)
+        processed_path = os.path.join(out_dir, processed_filename)
+        with open(processed_path, "wb") as f:
+            f.write(processed_bytes)
+
+        # ============================================================
         # 6. PP-StructureV3 & OCR Extraction
         # ============================================================
         structure_results = None
@@ -93,8 +121,8 @@ class ScanService:
 
         if engine and engine.initialized:
             try:
-                # Run prediction on saved image path
-                structure_results = engine.predict(input_path)
+                # Run prediction on restored & dewarped document image
+                structure_results = engine.predict(processed_path)
             except Exception as e:
                 logger.warning(f"PP-StructureV3 prediction failed during scan: {e}")
 
@@ -110,7 +138,7 @@ class ScanService:
                 if rec_texts:
                     full_text_list.extend(rec_texts)
                     scores.extend(rec_scores)
-            
+
             if full_text_list:
                 avg_conf = float(sum(scores) / len(scores)) if scores else 0.85
                 ocr_res = {
@@ -131,32 +159,6 @@ class ScanService:
             quality,
             ocr_res
         )
-
-        # ============================================================
-        # 8. Save processed image and raw PP-Structure output
-        # ============================================================
-        processed_filename = f"{scan_id}_processed.jpg"
-
-        out_dir = os.path.join(
-            "data",
-            "output"
-        )
-
-        os.makedirs(
-            out_dir,
-            exist_ok=True
-        )
-
-        processed_path = os.path.join(
-            out_dir,
-            processed_filename
-        )
-
-        with open(
-            processed_path,
-            "wb"
-        ) as f:
-            f.write(processed_bytes)
 
         if structure_results:
             try:

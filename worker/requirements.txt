@@ -1,11 +1,16 @@
-# Requirements cho Real AI Worker (OpenCV, PaddleOCR, python-docx)
+# Requirements cho Real AI Worker (OpenCV, PaddleOCR, DocumentRestorationUNet, python-docx)
 requests>=2.31.0
 python-dotenv>=1.0.0
 numpy>=1.24.0
 opencv-python-headless>=4.8.0
 Pillow>=10.0.0
 python-docx>=1.1.0
+pydantic-settings>=2.2.0
 
-# PaddleOCR & PaddlePaddle (cài thủ công tùy thuộc CPU/GPU):
+# PyTorch cho DocumentRestorationUNet
+torch>=2.0.0
+torchvision>=0.15.0
+
+# PaddleOCR & PaddlePaddle:
 # paddlepaddle>=2.5.0
 # paddleocr>=2.7.0

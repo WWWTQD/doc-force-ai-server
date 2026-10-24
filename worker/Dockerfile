@@ -1,7 +1,7 @@
-# ─── Stage 1: Build dependencies ───────────────────────────────────────────
-FROM python:3.10-slim AS base
+# ─── Doc Forge AI Worker (PaddleOCR + DocumentRestorationUNet) ─────────────
+FROM python:3.11-slim AS base
 
-# Cài libgomp (OpenCV cần), libgl, libglib và curl (health check)
+# Cài đặt thư viện hệ thống cần thiết cho OpenCV, PyTorch và curl
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 \
         libgl1 \
@@ -15,14 +15,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy toàn bộ worker code
+# Copy toàn bộ mã nguồn (bao gồm worker, app, models, training)
 COPY . .
 
-# ─── Health check ───────────────────────────────────────────────────────────
-# Worker không có HTTP server riêng — script --health chỉ kiểm tra import
+# Đặt thư mục làm việc tại worker để thực thi script worker
+WORKDIR /app/worker
+
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
   CMD python -c "import requests; import cv2; print('OK')" || exit 1
 
-# ─── Entrypoint ─────────────────────────────────────────────────────────────
-# Mặc định chạy mock_worker.py (thay bằng real_worker.py khi cài PaddleOCR xong)
-CMD ["python", "mock_worker.py"]
+CMD ["python", "real_worker.py"]

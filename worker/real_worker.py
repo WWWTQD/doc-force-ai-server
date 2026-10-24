@@ -1,7 +1,7 @@
 """
 Real AI Worker cho Doc Forge.
 
-Tích hợp OpenCV ImagePreprocessor và PaddleOCR (hoặc OCREngine)
+Tích hợp OpenCV ImagePreprocessor, DocumentRestorationUNet và PaddleOCR (hoặc OCREngine)
 để xử lý ảnh thực tế từ Backend. Đồng thời xử lý Job dạng EXPORT.
 
 Vòng lặp:
@@ -9,8 +9,10 @@ Vòng lặp:
   2. Nếu job type == "OCR":
        - Tải ảnh gốc: GET /api/worker/jobs/{id}/pages/{pageId}/original  (+ X-Lease-Token)
        - Tiền xử lý (OpenCV Deskew, Denoise, CLAHE)
-       - Nhận dạng chữ bằng OCREngine (PaddleOCR)
-       - POST /api/worker/jobs/{id}/results
+       - Khôi phục chất lượng ảnh bằng DocumentRestorationUNet (nền trắng sạch, nét chữ đậm)
+       - Upload ảnh đã khôi phục: POST /api/worker/jobs/{id}/pages/{pageId}/restored
+       - Nhận dạng chữ bằng OCREngine (PaddleOCR) trên ảnh đã khôi phục
+       - Gửi kết quả (rawLayoutJson + restoredImageKey): POST /api/worker/jobs/{id}/results
   3. Nếu job type == "EXPORT":
        - Tải snapshot JSON: GET /api/worker/jobs/{id}/snapshot           (+ X-Lease-Token)
        - Render file .docx bằng python-docx (hoặc export engine)
@@ -24,10 +26,21 @@ import logging
 import os
 import signal
 import socket
+import sys
 import threading
 import time
+from typing import Optional, Any
 import requests
+import cv2
 from dotenv import load_dotenv
+
+# Đảm bảo import được các module từ root và worker
+WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(WORKER_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+if WORKER_DIR not in sys.path:
+    sys.path.insert(0, WORKER_DIR)
 
 from preprocessor import ImagePreprocessor
 from ocr_engine import OCREngine
@@ -105,6 +118,22 @@ def _get_json(path: str, lease_token: str, timeout: int = 15) -> dict:
     return resp.json()
 
 
+def _upload_restored(job_id: str, page_id: str, lease_token: str, image_bytes: bytes, timeout: int = 30) -> str | None:
+    """Upload ảnh phục hồi lên Backend Storage — trả về storageKey hợp lệ hoặc None."""
+    url = f"{BACKEND_URL}/api/worker/jobs/{job_id}/pages/{page_id}/restored"
+    headers = _base_headers(lease_token)
+    files = {"file": ("restored.jpg", io.BytesIO(image_bytes), "image/jpeg")}
+    try:
+        resp = requests.post(url, files=files, headers=headers, timeout=timeout)
+        if resp.ok:
+            data = resp.json()
+            return data.get("storageKey")
+        LOG.warning("Upload ảnh restored trang %s trả về HTTP %d: %s", page_id, resp.status_code, resp.text)
+    except Exception as exc:
+        LOG.warning("Lỗi kết nối khi upload ảnh restored trang %s: %s", page_id, exc)
+    return None
+
+
 class HeartbeatThread(threading.Thread):
     def __init__(self, job_id: str, lease_token: str, stage: str = "OCR"):
         super().__init__(daemon=True)
@@ -140,7 +169,7 @@ def _claim_job() -> dict | None:
         raise
 
 
-def _process_ocr_job(job: dict, preprocessor: ImagePreprocessor, ocr_engine: OCREngine):
+def _process_ocr_job(job: dict, preprocessor: ImagePreprocessor, ocr_engine: OCREngine, restoration_service: Optional[Any] = None):
     job_id = job["jobId"]
     lease_token = job["leaseToken"]
     pages = job.get("pages", [])
@@ -160,26 +189,48 @@ def _process_ocr_job(job: dict, preprocessor: ImagePreprocessor, ocr_engine: OCR
             page_number = page["pageNumber"]
             LOG.info("  -> Tải ảnh gốc trang %d/%d (pageId=%s)...", idx, len(pages), page_id)
 
-            # FIX: truyền lease_token theo đúng X-Lease-Token header
             image_bytes = _get_bytes(
                 f"/api/worker/jobs/{job_id}/pages/{page_id}/original",
                 lease_token=lease_token,
             )
 
-            # 1. Preprocess
+            # 1. Preprocess (Deskew, Denoise, CLAHE)
             LOG.info("  -> Đang tiền xử lý ảnh (OpenCV Deskew, Denoise, CLAHE)...")
             cv_img, _ = preprocessor.process(image_bytes)
 
-            # 2. OCR Layout
+            # 2. Document Image Restoration (DocumentRestorationUNet)
+            restored_image_key = None
+            if restoration_service is not None and restoration_service.is_available:
+                try:
+                    LOG.info("  -> Đang khôi phục ảnh bằng DocumentRestorationUNet...")
+                    restored_cv = restoration_service.restore_image_bgr(
+                        cv_img,
+                        tile_size=512,
+                        overlap=64,
+                        preserve_color=True,
+                    )
+                    success, restored_buf = cv2.imencode(".jpg", restored_cv, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    if success:
+                        restored_bytes = restored_buf.tobytes()
+                        restored_image_key = _upload_restored(job_id, page_id, lease_token, restored_bytes)
+                        if restored_image_key:
+                            LOG.info("  ✓ Đã upload ảnh restored: %s", restored_image_key)
+                    # Chuyển ảnh đã khôi phục sang cho OCR
+                    cv_img = restored_cv
+                except Exception as ex:
+                    LOG.warning("  Khôi phục ảnh lỗi: %s. Dùng ảnh gốc.", ex)
+
+            # 3. OCR Layout trên ảnh đã khôi phục
             LOG.info("  -> Đang chạy nhận dạng OCR...")
             layout_json = ocr_engine.process_image(cv_img, page_number)
 
             page_results.append({
                 "pageId": page_id,
-                "restoredImageKey": None,
+                "restoredImageKey": restored_image_key,
                 "rawLayoutJson": layout_json,
             })
-            LOG.info("  ✓ Trang %d hoàn tất (%d blocks nhận dạng)", page_number, len(layout_json.get("blocks", [])))
+            LOG.info("  ✓ Trang %d hoàn tất (%d blocks nhận dạng, restoredImageKey=%s)", 
+                     page_number, len(layout_json.get("blocks", [])), restored_image_key)
 
         if heartbeat.failed:
             LOG.warning("  Mất heartbeat — bỏ qua gửi kết quả job %s", job_id)
@@ -191,7 +242,7 @@ def _process_ocr_job(job: dict, preprocessor: ImagePreprocessor, ocr_engine: OCR
             {
                 "leaseToken": lease_token,
                 "pageResults": page_results,
-                "pipelineVersion": "real-worker-paddleocr-v1.0",
+                "pipelineVersion": "real-worker-paddleocr-unet-v4",
             },
         )
         LOG.info("══ [OCR JOB %s] SUCCEEDED ══", job_id)
@@ -214,18 +265,22 @@ def _process_export_job(job: dict):
     heartbeat.start()
 
     try:
-        # FIX: path /snapshot (không phải /export-snapshot) + truyền X-Lease-Token
         LOG.info("  -> Tải export snapshot JSON từ Backend...")
         snapshot = _get_json(f"/api/worker/jobs/{job_id}/snapshot", lease_token=lease_token)
 
         # Tạo file DOCX bằng python-docx
         docx_bytes = _generate_docx_from_snapshot(snapshot)
 
-        # FIX: path /artifact (không phải /export-artifact) + X-Lease-Token header
-        LOG.info("  -> Upload DOCX artifact (%d bytes)...", len(docx_bytes))
+        # Upload file kết quả lên backend qua endpoint /artifact
         url = f"{BACKEND_URL}/api/worker/jobs/{job_id}/artifact"
-        files = {"file": ("document.docx", docx_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")}
-        headers = _base_headers(lease_token)  # bao gồm cả X-Lease-Token
+        headers = _base_headers(lease_token)
+        files = {
+            "file": (
+                f"export-{job_id}.docx",
+                io.BytesIO(docx_bytes),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        }
         resp = requests.post(url, files=files, headers=headers, timeout=30)
         resp.raise_for_status()
         artifact_data = resp.json()
@@ -254,12 +309,10 @@ def _process_export_job(job: dict):
 def _generate_docx_from_snapshot(snapshot: dict) -> bytes:
     """Tái tạo văn bản Word .docx từ snapshot JSON các trang."""
     if not DOCX_AVAILABLE:
-        # Fallback zip / minimal docx nếu không có python-docx
         raise RuntimeError("python-docx chưa được cài đặt. Hãy chạy: pip install python-docx")
 
     doc = docx.Document()
 
-    # Cấu hình lề trang (1 inch)
     sections = doc.sections
     for section in sections:
         section.top_margin = Inches(1)
@@ -274,8 +327,6 @@ def _generate_docx_from_snapshot(snapshot: dict) -> bytes:
 
         layout = page.get("layout", {})
         blocks = layout.get("blocks", [])
-
-        # Sắp xếp blocks theo order
         blocks.sort(key=lambda b: b.get("order", 0))
 
         for block in blocks:
@@ -289,7 +340,6 @@ def _generate_docx_from_snapshot(snapshot: dict) -> bytes:
                 p.paragraph_format.space_before = Pt(12)
                 p.paragraph_format.space_after = Pt(6)
             elif "table" in b_type:
-                # Render table nếu có dữ liệu bảng, nếu không thì render như đoạn văn
                 p = doc.add_paragraph()
                 run = p.add_run(f"[BẢNG]: {text}")
                 run.bold = True
@@ -322,15 +372,28 @@ def _try_fail(job_id: str, lease_token: str, error_code: str, error_message: str
 
 
 def main():
-    LOG.info("╔══════════════════════════════════════╗")
-    LOG.info("║   Doc Forge — Real AI Worker v1.1    ║")
-    LOG.info("╚══════════════════════════════════════╝")
+    LOG.info("╔═════════════════════════════════════════════════╗")
+    LOG.info("║ Doc Forge — Real AI Worker (U-Net v4 + OCR)     ║")
+    LOG.info("╚═════════════════════════════════════════════════╝")
     LOG.info("Backend URL  : %s", BACKEND_URL)
     LOG.info("Worker ID    : %s", WORKER_INSTANCE_ID)
     LOG.info("Poll interval: %.0fs\n", POLL_INTERVAL)
 
     preprocessor = ImagePreprocessor()
     ocr_engine = OCREngine(lang="vi")
+
+    # Khởi tạo mô hình DocumentRestorationUNet
+    restoration_service = None
+    try:
+        from app.services.restoration_service import RestorationService
+        restoration_service = RestorationService.get_instance()
+        restoration_service.initialize()
+        if restoration_service.is_available:
+            LOG.info("DocumentRestorationUNet đã sẵn sàng phục vụ AI Worker.")
+        else:
+            LOG.warning("RestorationService khởi tạo nhưng mô hình chưa sẵn sàng (sẽ fallback ảnh gốc).")
+    except Exception as ex:
+        LOG.warning("Không thể khởi tạo RestorationService: %s", ex)
 
     consecutive_errors = 0
 
@@ -349,7 +412,7 @@ def main():
             if job_type == "EXPORT":
                 _process_export_job(job)
             else:
-                _process_ocr_job(job, preprocessor, ocr_engine)
+                _process_ocr_job(job, preprocessor, ocr_engine, restoration_service=restoration_service)
 
         except requests.exceptions.ConnectionError:
             consecutive_errors += 1

@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Load PP-StructureV3 model once during application startup
+    # Startup: Load PP-StructureV3 engine
     logger.info("[App] Starting up: initializing PP-StructureV3 engine...")
     try:
         engine = StructureEngine.get_instance()
@@ -32,6 +32,22 @@ async def lifespan(app: FastAPI):
         )
     except Exception as e:
         logger.error(f"[App] Failed to load PP-StructureV3 on startup: {e}")
+
+    # Startup: Preload DocumentRestorationUNet
+    try:
+        from app.services.restoration_service import RestorationService
+        restoration = RestorationService.get_instance()
+        restoration.initialize(device_name=settings.AI_DEVICE)
+    except Exception as e:
+        logger.warning(f"[App] Failed to preload RestorationService: {e}")
+
+    # Startup: Preload YOLOv8 document detector
+    try:
+        from app.services.yolo_service import YOLOService
+        yolo = YOLOService()
+        yolo.load_model()
+    except Exception as e:
+        logger.warning(f"[App] Failed to preload YOLOService: {e}")
 
     yield
 
