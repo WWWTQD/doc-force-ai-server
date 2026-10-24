@@ -2,12 +2,14 @@
 # Cung cấp REST API phân tích ảnh, OCR test, quality check.
 FROM python:3.11-slim
 
-# Cài Tesseract (dùng bởi pytesseract trong pipeline) và curl (healthcheck)
+# Cài Tesseract (dùng bởi pytesseract trong pipeline), thư viện đồ họa OpenCV và curl (healthcheck)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tesseract-ocr \
         tesseract-ocr-eng \
         tesseract-ocr-vie \
         libgomp1 \
+        libgl1 \
+        libglib2.0-0 \
         curl \
     && rm -rf /var/lib/apt/lists/*
 

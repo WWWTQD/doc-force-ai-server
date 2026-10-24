@@ -1,9 +1,11 @@
 # ─── Stage 1: Build dependencies ───────────────────────────────────────────
 FROM python:3.10-slim AS base
 
-# Cài libgomp (OpenCV cần) và curl (health check)
+# Cài libgomp (OpenCV cần), libgl, libglib và curl (health check)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 \
+        libgl1 \
+        libglib2.0-0 \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
