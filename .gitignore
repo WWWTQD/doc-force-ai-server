@@ -62,3 +62,6 @@ Thumbs.db
 
 # Local AI reference (not for GitHub)
 LOCAL_AI_STATUS.md
+
+# Experiment evaluation output
+eval_results/
