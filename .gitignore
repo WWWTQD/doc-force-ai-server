@@ -8,6 +8,7 @@ venv/
 
 # Environment
 .env
+.env.*
 
 # IntelliJ IDEA
 .idea/
@@ -20,11 +21,19 @@ models/
 *.onnx
 *.safetensors
 
-# Upload/output
+# Upload/output & test scans
 uploads/
 outputs/
 data/input/
 data/output/
+latest_doc/
+*.jpg
+*.jpeg
+*.png
+*.bmp
+test_restored.jpg
+test_layout.json
+
 # Firmware (may contain WiFi credentials/device keys)
 firmware/
 
