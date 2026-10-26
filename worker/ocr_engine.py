@@ -20,37 +20,13 @@ import cv2
 import numpy as np
 from collections import OrderedDict
 
-# Đảm bảo import torch trước paddle để tránh xung đột DLL trên Windows
+# Đảm bảo import torch trước nếu có
 try:
     import torch
 except Exception:
     pass
 
-try:
-    import paddle
-    # Monkeypatch xử lý lỗi oneDNN / PIR trên Windows CPU trong PaddleX
-    import paddlex.inference.models.runners.paddle_static.runner as runner_mod
-    _orig_resolve = runner_mod.resolve_paddle_static_engine_config
-
-    def _safe_resolve(model_name, engine_config):
-        cfg = _orig_resolve(model_name, engine_config)
-        if cfg.get("device_type") == "cpu":
-            cfg["run_mode"] = "paddle"
-            cfg["enable_new_ir"] = False
-        return cfg
-
-    runner_mod.resolve_paddle_static_engine_config = _safe_resolve
-except Exception:
-    pass
-
 LOG = logging.getLogger("ocr_engine")
-
-PADDLE_AVAILABLE = False
-try:
-    from paddleocr import PaddleOCR
-    PADDLE_AVAILABLE = True
-except ImportError:
-    pass
 
 PYTESSERACT_AVAILABLE = False
 try:
@@ -83,6 +59,14 @@ VIETNAMESE_REPLACEMENTS = [
     (r"\bmãu\b", "mẫu"),
     (r"\bxạ\b", "xã"),
     (r"\bviec\b", "việc"),
+    (r"\bCONG\s+HOA\b", "CỘNG HÒA"),
+    (r"\bCONG\s+HÒA\b", "CỘNG HÒA"),
+    (r"\bMỖI\s+TRƯỜNG\b", "MÔI TRƯỜNG"),
+    (r"\bCHỦ\s+NGHTA\b", "CHỦ NGHĨA"),
+    (r"\bCHỦ\s+NGHIA\b", "CHỦ NGHĨA"),
+    (r"\bTy\s+đo\b", "Tự do"),
+    (r"\bHạsh\s+phúc\b", "Hạnh phúc"),
+    (r"\bHanh\s+phúc\b", "Hạnh phúc"),
     ("å", "ả"),
     ("ō", "o"),
     ("ö", "ô"),
@@ -109,7 +93,7 @@ def clean_vietnamese_ocr_text(text: str) -> str:
 class OCREngine:
     """Wrapper thông minh quản lý OCR tốc độ cao và chuẩn hóa layout Tiếng Việt."""
 
-    def __init__(self, lang: str = "vi", use_gpu: bool = False, max_side: int = 1280):
+    def __init__(self, lang: str = "vi", use_gpu: bool = False, max_side: int = 1800):
         self.lang = lang
         self.use_gpu = use_gpu
         self.max_side = max_side
@@ -117,11 +101,12 @@ class OCREngine:
         self.tesseract_cmd = None
         self.docker_container = None
 
-        # 1. Kiểm tra Tesseract khả dụng
+        # 1. Kiểm tra Tesseract khả dụng (local hoặc container docforge-tesseract-engine)
         self._init_tesseract()
 
-        # 2. Khởi tạo PaddleOCR tối ưu tốc độ nếu cần
-        self._init_paddle(lang, use_gpu)
+        # 2. Chỉ khởi tạo trước PaddleOCR nếu chưa có Tesseract (hoặc khởi tạo lười khi fallback)
+        if not self.tesseract_cmd and not self.docker_container:
+            self._init_paddle(lang, use_gpu)
 
     def _init_tesseract(self):
         """Tìm binary tesseract nội bộ hoặc qua container docker."""
@@ -140,17 +125,34 @@ class OCREngine:
         try:
             res = subprocess.run(["docker", "ps", "--format", "{{.Names}}"], capture_output=True, text=True, timeout=3)
             for line in res.stdout.splitlines():
-                if "backend-worker" in line or "6d7c4189cb4c" in line:
-                    self.docker_container = line.strip()
-                    LOG.info("Phát hiện Tesseract sẵn có qua Docker Container: %s", self.docker_container)
+                name = line.strip()
+                if name == "docforge-tesseract-engine" or "docforge-tesseract-engine" in name:
+                    self.docker_container = name
+                    LOG.info("Phát hiện Tesseract Tiếng Việt tốc độ cao qua Docker: %s", self.docker_container)
                     return
         except Exception:
             pass
 
     def _init_paddle(self, lang: str, use_gpu: bool):
-        """Khởi tạo PaddleOCR với cấu hình tắt UVDoc (chỉ nhận dạng nhanh)."""
-        if not PADDLE_AVAILABLE:
+        """Khởi tạo lười (lazy-load) PaddleOCR với cấu hình tắt UVDoc khi cần."""
+        try:
+            import paddle
+            import paddlex.inference.models.runners.paddle_static.runner as runner_mod
+            _orig_resolve = runner_mod.resolve_paddle_static_engine_config
+
+            def _safe_resolve(model_name, engine_config):
+                cfg = _orig_resolve(model_name, engine_config)
+                if cfg.get("device_type") == "cpu":
+                    cfg["run_mode"] = "paddle"
+                    cfg["enable_new_ir"] = False
+                return cfg
+
+            runner_mod.resolve_paddle_static_engine_config = _safe_resolve
+            from paddleocr import PaddleOCR
+        except Exception as e:
+            LOG.warning("PaddleOCR không khả dụng: %s", e)
             return
+
         try:
             device = "gpu" if use_gpu else "cpu"
             LOG.info("Khởi tạo PaddleOCR tốc độ cao (lang=%s, device=%s, max_side=%d)...", lang, device, self.max_side)
@@ -194,7 +196,9 @@ class OCREngine:
             except Exception as e:
                 LOG.warning("Tesseract gặp lỗi: %s. Chuyển sang PaddleOCR...", e)
 
-        # Ưu tiên 2: PaddleOCR tốc độ cao + Clean Tiếng Việt
+        # Ưu tiên 2: PaddleOCR tốc độ cao + Clean Tiếng Việt (khởi tạo lười nếu cần)
+        if self.ocr_instance is None:
+            self._init_paddle(self.lang, self.use_gpu)
         if self.ocr_instance is not None:
             try:
                 return self._run_paddle_ocr(img, page_number, w, h)
@@ -205,71 +209,139 @@ class OCREngine:
         return self._run_fallback_ocr(img, page_number, w, h)
 
     def _run_tesseract_ocr(self, img: np.ndarray, page_number: int, width: int, height: int) -> dict:
-        """Chạy Tesseract với định dạng TSV để lấy chính xác Bounding Boxes và Text Tiếng Việt."""
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-            tmp_path = tmp.name
-            cv2.imwrite(tmp_path, img)
+        """
+        Chạy Tesseract 1 lần cho toàn trang (-l vie+eng --oem 1 --psm 3 tsv).
+        Bỏ giới hạn max_side=960. Giữ nguyên độ phân giải gốc của ảnh đã qua U-Net.
+        Nếu orig_w < 1200, phóng to 2x bằng INTER_CUBIC để đọc chuẩn các dòng chữ nhỏ,
+        sau đó quy đổi tọa độ bbox về đúng hệ tọa độ (width, height).
+        """
+        orig_w, orig_h = width, height
+
+        # Phóng to 2x nếu chiều rộng nhỏ để Tesseract nhận dạng nét chữ nhỏ sắc nét
+        if orig_w < 1200:
+            scale_factor = 2.0
+            new_w = int(round(orig_w * scale_factor))
+            new_h = int(round(orig_h * scale_factor))
+            infer_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+        else:
+            scale_factor = 1.0
+            infer_img = img
+
+        ok, encoded_buf = cv2.imencode(".png", infer_img)
+        if not ok:
+            ok, encoded_buf = cv2.imencode(".jpg", infer_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            if not ok:
+                return None
+        jpg_bytes = encoded_buf.tobytes()
 
         tsv_data = ""
-        try:
-            if self.tesseract_cmd:
-                cmd = [self.tesseract_cmd, tmp_path, "stdout", "-l", "vie+eng", "tsv"]
-                res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=15, check=True)
-                tsv_data = res.stdout
-            elif self.docker_container:
-                # Copy tạm vào container
-                subprocess.run(["docker", "cp", tmp_path, f"{self.docker_container}:/tmp/ocr_task.jpg"], check=True, timeout=5, capture_output=True)
-                res = subprocess.run(
-                    ["docker", "exec", self.docker_container, "tesseract", "/tmp/ocr_task.jpg", "stdout", "-l", "vie+eng", "tsv"],
-                    capture_output=True, text=True, encoding="utf-8", timeout=15, check=True
-                )
-                tsv_data = res.stdout
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+        threads = str(max(4, os.cpu_count() or 4))
+        if self.tesseract_cmd:
+            env = os.environ.copy()
+            env["OMP_THREAD_LIMIT"] = threads
+            res = subprocess.run(
+                [self.tesseract_cmd, "stdin", "stdout", "-l", "vie+eng", "--oem", "1", "--psm", "3", "tsv"],
+                input=jpg_bytes,
+                capture_output=True,
+                timeout=20,
+                check=True,
+                env=env,
+            )
+            tsv_data = res.stdout.decode("utf-8", errors="replace")
+        elif self.docker_container:
+            res = subprocess.run(
+                ["docker", "exec", "-i", "-e", f"OMP_THREAD_LIMIT={threads}", self.docker_container, "tesseract", "stdin", "stdout", "-l", "vie+eng", "--oem", "1", "--psm", "3", "tsv"],
+                input=jpg_bytes,
+                capture_output=True,
+                timeout=20,
+                check=True,
+            )
+            tsv_data = res.stdout.decode("utf-8", errors="replace")
 
         if not tsv_data:
             return None
 
-        # Parse TSV
+        # Gom các từ (level == 5) theo từng dòng (block_num, par_num, line_num)
         lines = OrderedDict()
         for row in csv.DictReader(io.StringIO(tsv_data), delimiter="\t", quoting=csv.QUOTE_NONE):
-            if row.get("level") != "5" or not row.get("text", "").strip():
+            if row.get("level") != "5":
                 continue
-            conf = max(0.0, min(1.0, float(row["conf"]) / 100))
-            x, y, bw, bh = int(row["left"]), int(row["top"]), int(row["width"]), int(row["height"])
+            word_text = row.get("text", "").strip()
+            if not word_text:
+                continue
+
+            try:
+                raw_conf = float(row.get("conf", -1))
+            except (ValueError, TypeError):
+                raw_conf = -1.0
+
+            # Lọc bỏ các box rỗng hoặc ký tự nhiễu rác đơn lẻ có conf < 30
+            if raw_conf < 30.0 and len(word_text) <= 1:
+                continue
+            if raw_conf < 15.0:
+                continue
+
+            conf_val = max(0.0, min(1.0, raw_conf / 100.0))
+
+            try:
+                left = int(row["left"])
+                top = int(row["top"])
+                bw = int(row["width"])
+                bh = int(row["height"])
+            except (ValueError, KeyError):
+                continue
+
+            # Quy đổi tọa độ bbox về đúng hệ tọa độ gốc (orig_w, orig_h)
+            x1 = int(round(left / scale_factor))
+            y1 = int(round(top / scale_factor))
+            x2 = int(round((left + bw) / scale_factor))
+            y2 = int(round((top + bh) / scale_factor))
+
             key = (row["block_num"], row["par_num"], row["line_num"])
-            line = lines.setdefault(key, {"words": [], "bbox": [width, height, 0, 0], "conf": []})
-            line["words"].append(row["text"].strip())
-            line["conf"].append(conf)
+            line = lines.setdefault(key, {"words": [], "bbox": [x1, y1, x2, y2], "conf": []})
+            line["words"].append(word_text)
+            line["conf"].append(conf_val)
             b = line["bbox"]
-            b[:] = [min(b[0], x), min(b[1], y), max(b[2], x + bw), max(b[3], y + bh)]
+            b[0] = min(b[0], x1)
+            b[1] = min(b[1], y1)
+            b[2] = max(b[2], x2)
+            b[3] = max(b[3], y2)
 
         blocks = []
         for idx, line in enumerate(lines.values(), 1):
-            text_line = clean_vietnamese_ocr_text(" ".join(line["words"]))
+            raw_text = " ".join(line["words"]).strip()
+            text_line = clean_vietnamese_ocr_text(raw_text)
             if not text_line:
                 continue
+
+            avg_conf = (sum(line["conf"]) / len(line["conf"])) if line["conf"] else 0.8
+            # Lọc bỏ dòng rác quá ngắn và confidence thấp
+            if avg_conf < 0.30 and len(text_line) <= 2:
+                continue
+
             x1, y1, x2, y2 = line["bbox"]
-            x1 = max(0, min(x1, width - 1))
-            y1 = max(0, min(y1, height - 1))
-            x2 = max(x1 + 1, min(x2, width))
-            y2 = max(y1 + 1, min(y2, height))
+            x1 = max(0, min(x1, orig_w - 1))
+            y1 = max(0, min(y1, orig_h - 1))
+            x2 = max(x1 + 1, min(x2, orig_w))
+            y2 = max(y1 + 1, min(y2, orig_h))
+
+            line_height = y2 - y1
+            is_heading = line_height > 35 or (line_height > 24 and text_line.isupper() and len(text_line) > 5)
 
             blocks.append({
                 "id": f"b-{idx}-{uuid.uuid4().hex[:6]}",
-                "type": "heading" if (y2 - y1) > 35 else "paragraph",
+                "type": "heading" if is_heading else "paragraph",
                 "order": idx,
                 "bbox": [x1, y1, x2, y2],
                 "text": text_line,
-                "confidence": round(sum(line["conf"]) / len(line["conf"]), 3),
+                "confidence": round(avg_conf, 3),
             })
 
         return {
             "schemaVersion": 1,
             "pageNumber": page_number,
-            "width": width,
-            "height": height,
+            "width": orig_w,
+            "height": orig_h,
             "blocks": blocks,
         }
 

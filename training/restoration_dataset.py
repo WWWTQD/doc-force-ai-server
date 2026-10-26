@@ -338,10 +338,10 @@ def infer_single_image_tiled(
     """
     h_orig, w_orig = img_gray.shape[:2]
 
-    # On CPU, if image is ultra-high resolution (>1600px, e.g. 9MP-12MP camera raw),
-    # run tiled U-Net at 1280px working scale (YOLOv8 native high-res) and upsample back
-    if device.type == "cpu" and max(h_orig, w_orig) > 1600 and tile_size <= 512:
-        scale = 1280.0 / float(max(h_orig, w_orig))
+    # On CPU, if image is ultra-high resolution (>1800px, e.g. 9MP-12MP camera raw),
+    # run tiled U-Net at 1600px working scale and upsample back
+    if device.type == "cpu" and max(h_orig, w_orig) > 1800 and tile_size <= 512:
+        scale = 1600.0 / float(max(h_orig, w_orig))
         w_work = max(64, int(round(w_orig * scale)))
         h_work = max(64, int(round(h_orig * scale)))
         img_work = cv2.resize(img_gray, (w_work, h_work), interpolation=cv2.INTER_AREA)

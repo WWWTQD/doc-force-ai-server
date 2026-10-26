@@ -73,7 +73,7 @@ class RestorationService:
         else:
             self._device = torch.device("cpu")
             try:
-                torch.set_num_threads(4)
+                torch.set_num_threads(max(4, os.cpu_count() or 8))
             except Exception:
                 pass
 
@@ -161,18 +161,46 @@ class RestorationService:
 
             from training.restoration_dataset import infer_single_image_tiled
 
+            orig_h, orig_w = gray.shape[:2]
             t0 = time.perf_counter()
+
+            # Đảm bảo bật đa luồng PyTorch (tránh bị reset về 1 thread bởi thư viện khác)
+            if self._device is not None and self._device.type == "cpu":
+                try:
+                    torch.set_num_threads(max(4, os.cpu_count() or 8))
+                except Exception:
+                    pass
+
+            # Giữ độ phân giải chuẩn cho chữ nhỏ:
+            # - Nếu max(orig_h, orig_w) <= 1800: giữ nguyên kích thước gốc khi đưa vào infer_single_image_tiled
+            # - Nếu ảnh chụp quá lớn (> 1800): resize về max_side = 1600 để chạy U-Net, sau đó resize INTER_CUBIC về kích thước gốc
+            if max(orig_h, orig_w) > 1800:
+                scale = 1600.0 / float(max(orig_h, orig_w))
+                w_work = max(64, int(round(orig_w * scale)))
+                h_work = max(64, int(round(orig_h * scale)))
+                gray_work = cv2.resize(gray, (w_work, h_work), interpolation=cv2.INTER_AREA)
+            else:
+                gray_work = gray
+
+            # Chạy thuần túy U-Net (Pure DocumentRestorationUNet) không qua bất kỳ bộ lọc trộn norm_full/hình thái học nào
             with torch.no_grad():
-                y_clean = infer_single_image_tiled(
+                y_work = infer_single_image_tiled(
                     self._model,
-                    gray,
+                    gray_work,
                     self._device,
-                    tile_size=t_size,
-                    overlap=ovlap,
+                    tile_size=t_size or 512,
+                    overlap=ovlap or 64,
                     refine_glyphs=False,
                 )
+
+            # Đảm bảo kết quả trả về đúng kích thước gốc (orig_w, orig_h)
+            if y_work.shape[:2] != (orig_h, orig_w):
+                y_clean = cv2.resize(y_work, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
+            else:
+                y_clean = y_work
+
             dur_ms = (time.perf_counter() - t0) * 1000.0
-            logger.debug("[RestorationService] Restored image shape %s in %.1fms", gray.shape, dur_ms)
+            logger.info("[RestorationService] Restored image shape %s in %.1fms", gray.shape, dur_ms)
 
             if not keep_color:
                 return cv2.cvtColor(y_clean, cv2.COLOR_GRAY2BGR)

@@ -1,4 +1,4 @@
-# ─── Doc Forge AI Worker (Tesseract + PaddleOCR + DocumentRestorationUNet) ──
+# ─── Doc Forge AI Worker (Tesseract 5 + YOLOv8 + DocumentRestorationUNet) ──
 FROM python:3.11-slim AS base
 
 # Cài đặt thư viện hệ thống cho OpenCV, PyTorch, curl, và Tesseract OCR (Tiếng Việt + Tiếng Anh)
@@ -14,17 +14,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy requirements trước để tận dụng layer cache
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Bước 1: Cài đặt PyTorch CPU-only trước (~185MB thay vì bản CUDA 2.5GB)
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+        torch \
+        torchvision
 
-# Copy toàn bộ mã nguồn (bao gồm worker, app, models, training)
+# Bước 2: Cài đặt các thư viện còn lại (giữ nguyên torch CPU đã cài)
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
+        ultralytics \
+        opencv-python-headless \
+        numpy \
+        pillow \
+        requests \
+        python-docx \
+        python-dotenv \
+        pydantic \
+        pydantic-settings \
+        pyyaml \
+        pytesseract
+
+# Copy mã nguồn (bao gồm worker, app, training)
 COPY . .
 
-# Đặt thư mục làm việc tại worker để thực thi script worker
+# Đặt thư mục làm việc tại worker để thực thi real_worker.py
 WORKDIR /app/worker
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-  CMD python -c "import requests; import cv2; print('OK')" || exit 1
+  CMD python -c "import requests, cv2, torch; print('OK')" || exit 1
 
-CMD ["python", "real_worker.py"]
+CMD ["python", "-u", "real_worker.py"]

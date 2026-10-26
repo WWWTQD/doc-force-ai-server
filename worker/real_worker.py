@@ -65,12 +65,13 @@ logging.basicConfig(
 )
 LOG = logging.getLogger("real_worker")
 
-BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8080").rstrip("/")
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://127.0.0.1:8080").rstrip("/").replace("://localhost", "://127.0.0.1")
 WORKER_SECRET_KEY = os.environ.get("WORKER_SECRET_KEY", "worker-secret-local")
 WORKER_INSTANCE_ID = os.environ.get("WORKER_INSTANCE_ID", socket.gethostname()[:100])
-POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL_SECONDS", "2"))
-HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "20"))
+POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL_SECONDS", "1"))
+HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "10"))
 
+HTTP_SESSION = requests.Session()
 STOP = threading.Event()
 
 
@@ -95,7 +96,7 @@ def _post(path: str, payload: dict, timeout: int = 15, lease_token: str | None =
     url = f"{BACKEND_URL}{path}"
     headers = _base_headers(lease_token)
     headers["Content-Type"] = "application/json"
-    resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+    resp = HTTP_SESSION.post(url, json=payload, headers=headers, timeout=timeout)
     if resp.status_code == 204:
         return None
     resp.raise_for_status()
@@ -105,7 +106,7 @@ def _post(path: str, payload: dict, timeout: int = 15, lease_token: str | None =
 def _get_bytes(path: str, lease_token: str, timeout: int = 30) -> bytes:
     """Tải bytes (ảnh gốc) — bắt buộc truyền lease_token."""
     url = f"{BACKEND_URL}{path}"
-    resp = requests.get(url, headers=_base_headers(lease_token), timeout=timeout)
+    resp = HTTP_SESSION.get(url, headers=_base_headers(lease_token), timeout=timeout)
     resp.raise_for_status()
     return resp.content
 
@@ -113,7 +114,7 @@ def _get_bytes(path: str, lease_token: str, timeout: int = 30) -> bytes:
 def _get_json(path: str, lease_token: str, timeout: int = 15) -> dict:
     """Tải JSON (snapshot) — bắt buộc truyền lease_token."""
     url = f"{BACKEND_URL}{path}"
-    resp = requests.get(url, headers=_base_headers(lease_token), timeout=timeout)
+    resp = HTTP_SESSION.get(url, headers=_base_headers(lease_token), timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 
@@ -124,7 +125,7 @@ def _upload_restored(job_id: str, page_id: str, lease_token: str, image_bytes: b
     headers = _base_headers(lease_token)
     files = {"file": ("restored.jpg", io.BytesIO(image_bytes), "image/jpeg")}
     try:
-        resp = requests.post(url, files=files, headers=headers, timeout=timeout)
+        resp = HTTP_SESSION.post(url, files=files, headers=headers, timeout=timeout)
         if resp.ok:
             data = resp.json()
             return data.get("storageKey")
@@ -132,6 +133,21 @@ def _upload_restored(job_id: str, page_id: str, lease_token: str, image_bytes: b
     except Exception as exc:
         LOG.warning("Lỗi kết nối khi upload ảnh restored trang %s: %s", page_id, exc)
     return None
+
+
+def _send_heartbeat(job_id: str, lease_token: str, progress: int = 50, stage: str = "OCR") -> bool:
+    """Gửi heartbeat chủ động từ luồng chính để gia hạn lease_expires_at ngay tức thì."""
+    try:
+        _post(
+            f"/api/worker/jobs/{job_id}/heartbeat",
+            {"leaseToken": lease_token, "progress": progress, "stage": stage},
+            timeout=5,
+        )
+        LOG.info("  ✓ Heartbeat gia hạn lease OK (job %s, stage=%s, progress=%d%%)", job_id, stage, progress)
+        return True
+    except Exception as exc:
+        LOG.warning("  Cảnh báo heartbeat thủ công (job %s): %s", job_id, exc)
+        return False
 
 
 class HeartbeatThread(threading.Thread):
@@ -142,19 +158,26 @@ class HeartbeatThread(threading.Thread):
         self.stage = stage
         self._stop_evt = threading.Event()
         self.failed = False
+        self.consecutive_fails = 0
 
     def run(self):
-        while not self._stop_evt.wait(HEARTBEAT_INTERVAL):
+        # Gia hạn ngay lập tức khi nhận job
+        _send_heartbeat(self.job_id, self.lease_token, progress=10, stage=self.stage)
+        while not self._stop_evt.wait(10.0):  # Gửi định kỳ mỗi 10 giây
             try:
                 _post(
                     f"/api/worker/jobs/{self.job_id}/heartbeat",
                     {"leaseToken": self.lease_token, "progress": 50, "stage": self.stage},
+                    timeout=5,
                 )
+                self.consecutive_fails = 0
                 LOG.debug("Heartbeat OK — job %s", self.job_id)
             except Exception as exc:
-                LOG.warning("Heartbeat thất bại — job %s: %s", self.job_id, exc)
-                self.failed = True
-                return
+                self.consecutive_fails += 1
+                LOG.warning("Heartbeat định kỳ cảnh báo (%d/5) — job %s: %s", self.consecutive_fails, self.job_id, exc)
+                if self.consecutive_fails >= 5:
+                    self.failed = True
+                    return
 
     def stop(self):
         self._stop_evt.set()
@@ -194,36 +217,49 @@ def _process_ocr_job(job: dict, preprocessor: ImagePreprocessor, ocr_engine: OCR
                 lease_token=lease_token,
             )
 
-            # 1. Preprocess (Deskew, Denoise, CLAHE)
-            LOG.info("  -> Đang tiền xử lý ảnh (OpenCV Deskew, Denoise, CLAHE)...")
-            cv_img, _ = preprocessor.process(image_bytes)
+            # 1. Giữ nguyên 100% kích thước khung ảnh gốc (orig_w, orig_h), không dùng bước crop/warp làm mất dòng chữ
+            _send_heartbeat(job_id, lease_token, progress=15, stage="PREPROCESSING")
+            orig_img = preprocessor.decode_image(image_bytes)
+            orig_h, orig_w = orig_img.shape[:2]
+            LOG.info("  -> Giữ nguyên khung ảnh gốc: %dx%d (bỏ qua crop)", orig_w, orig_h)
 
             # 2. Document Image Restoration (DocumentRestorationUNet)
             restored_image_key = None
+            cv_img = orig_img
             if restoration_service is not None and restoration_service.is_available:
                 try:
+                    _send_heartbeat(job_id, lease_token, progress=30, stage="RESTORING")
                     LOG.info("  -> Đang khôi phục ảnh bằng DocumentRestorationUNet...")
                     restored_cv = restoration_service.restore_image_bgr(
-                        cv_img,
+                        orig_img,
                         tile_size=512,
                         overlap=64,
                         preserve_color=True,
                     )
+                    # Đảm bảo ảnh restored_cv có shape[:2] == (orig_h, orig_w) chính xác 100%
+                    if restored_cv.shape[:2] != (orig_h, orig_w):
+                        restored_cv = cv2.resize(restored_cv, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
+
                     success, restored_buf = cv2.imencode(".jpg", restored_cv, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     if success:
                         restored_bytes = restored_buf.tobytes()
+                        # Gia hạn lease ngay trước khi upload ảnh restored
+                        _send_heartbeat(job_id, lease_token, progress=45, stage="RESTORING")
                         restored_image_key = _upload_restored(job_id, page_id, lease_token, restored_bytes)
                         if restored_image_key:
-                            LOG.info("  ✓ Đã upload ảnh restored: %s", restored_image_key)
+                            LOG.info("  ✓ Đã upload ảnh restored: %s (kích thước: %dx%d)", restored_image_key, orig_w, orig_h)
                     # Chuyển ảnh đã khôi phục sang cho OCR
                     cv_img = restored_cv
                 except Exception as ex:
                     LOG.warning("  Khôi phục ảnh lỗi: %s. Dùng ảnh gốc.", ex)
+                    cv_img = orig_img
 
-            # 3. OCR Layout trên ảnh đã khôi phục
-            LOG.info("  -> Đang chạy nhận dạng OCR...")
+            # 3. OCR Layout trên ảnh đã khôi phục (chuẩn hệ tọa độ orig_w x orig_h)
+            _send_heartbeat(job_id, lease_token, progress=55, stage="OCR")
+            LOG.info("  -> Đang chạy nhận dạng OCR trên ảnh %dx%d...", orig_w, orig_h)
             layout_json = ocr_engine.process_image(cv_img, page_number)
 
+            _send_heartbeat(job_id, lease_token, progress=85, stage="LAYOUT")
             page_results.append({
                 "pageId": page_id,
                 "restoredImageKey": restored_image_key,
@@ -232,11 +268,9 @@ def _process_ocr_job(job: dict, preprocessor: ImagePreprocessor, ocr_engine: OCR
             LOG.info("  ✓ Trang %d hoàn tất (%d blocks nhận dạng, restoredImageKey=%s)", 
                      page_number, len(layout_json.get("blocks", [])), restored_image_key)
 
-        if heartbeat.failed:
-            LOG.warning("  Mất heartbeat — bỏ qua gửi kết quả job %s", job_id)
-            return
-
-        # Gửi kết quả OCR về backend qua /results
+        # Gia hạn lease ngay trước khi gửi kết quả OCR về backend qua /results
+        heartbeat.stop()
+        _send_heartbeat(job_id, lease_token, progress=95, stage="LAYOUT")
         _post(
             f"/api/worker/jobs/{job_id}/results",
             {
@@ -396,6 +430,7 @@ def main():
         LOG.warning("Không thể khởi tạo RestorationService: %s", ex)
 
     consecutive_errors = 0
+    LOG.info("Waiting for jobs... (polling %s every %.0fs)", BACKEND_URL, POLL_INTERVAL)
 
     while not STOP.is_set():
         try:
