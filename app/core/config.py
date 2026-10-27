@@ -21,7 +21,13 @@ class Settings(BaseSettings):
     OUTPUT_DIR: str = "data/output"
     CORS_ORIGINS: List[str] = Field(default=["http://localhost:3000"])
 
+    # Document Restoration U-Net
+    AI_DEVICE: str = "cpu"
+    ENABLE_IMAGE_RESTORATION: bool = True
+    RESTORATION_MODEL_PATH: str = "models/restoration_best.pth"
+    RESTORATION_TILE_SIZE: int = 512
+    RESTORATION_OVERLAP: int = 64
+    RESTORATION_PRESERVE_COLOR: bool = True
 
 
 settings = Settings()
-

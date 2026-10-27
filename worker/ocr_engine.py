@@ -100,7 +100,7 @@ def _resolve_layout_model_path() -> str:
     env_path = os.environ.get("LAYOUT_MODEL_PATH")
     if env_path:
         return env_path
-    models_dir = os.path.join(os.path.dirname(__file__), "models")
+    models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
     for name in ("layout_best_backup.pt", "best.pt"):
         candidate = os.path.join(models_dir, name)
         if os.path.exists(candidate):
@@ -178,7 +178,9 @@ class OCREngine:
             try:
                 return self._run_paddle_ocr(img, page_number, w, h, yolo_regions=yolo_regions)
             except Exception as e:
+                import traceback
                 LOG.error("Lỗi trong quá trình chạy PaddleOCR: %s. Dùng fallback engine.", e)
+                traceback.print_exc()
 
         return self._run_fallback_ocr(img, page_number, w, h)
 
@@ -188,8 +190,8 @@ class OCREngine:
 
     def score_orientation(self, img: np.ndarray) -> float:
         """
-        Chấm điểm "đọc được" của ảnh ở hướng hiện tại (0..1), dùng để chọn 0° hay 180°.
-        Chạy PaddleOCR với cls=False trên bản thu nhỏ: chữ lộn ngược cho confidence thấp.
+        Chấm điểm "đọc được" của ảnh ở hướng hiện tại (0..1), dùng để chọn 0°/90°/180°/270°.
+        Chạy PaddleOCR với cls=False trên bản thu nhỏ: chữ lộn ngược hoặc nằm dọc cho confidence thấp.
         """
         if self.ocr_instance is None:
             return 0.0
@@ -199,14 +201,22 @@ class OCREngine:
         small = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else img
         results = self.ocr_instance.ocr(small, cls=False)
         confidences = []
+        horiz_boxes = 0
         if results and results[0]:
-            for _, (text, confidence) in results[0]:
-                if len(text.strip()) >= 3:
+            for poly, (text, confidence) in results[0]:
+                xs = [p[0] for p in poly]
+                ys = [p[1] for p in poly]
+                bw = max(xs) - min(xs)
+                bh = max(ys) - min(ys)
+                if bw > bh * 1.4:
+                    horiz_boxes += 1
+                if len(text.strip()) >= 3 and bw >= bh:
                     confidences.append(float(confidence))
         if not confidences:
             return 0.0
         coverage = min(1.0, len(confidences) / 5.0)
-        return float(np.mean(confidences)) * coverage
+        horiz_ratio = min(1.0, horiz_boxes / max(1.0, len(results[0]) * 0.7))
+        return float(np.mean(confidences)) * coverage * horiz_ratio
 
     def _detect_yolo_regions(self, img: np.ndarray, width: int, height: int) -> list[dict]:
         """
@@ -279,6 +289,7 @@ class OCREngine:
         def _right_margin_at(y_val: float) -> float:
             return slope * y_val + intercept
 
+        is_book_page = len(clean_wide) >= 10
         raw_items = []
         heights = []
         for b in dt_boxes:
@@ -291,42 +302,45 @@ class OCREngine:
             rm = _right_margin_at(ym)
 
             # Bỏ mảnh chữ rác ở gáy sách mép trái
-            if x2 < 120 and bw < 100:
+            if x2 < 80 and bw < 60:
                 continue
-            # Bỏ các mảnh chữ viết tay rời ở lề phải
-            if x1 > rm - 65 and bw < 220:
-                continue
-            # Cắt bớt đuôi hộp nếu dòng in bị nối dính vào chữ viết tay ở lề phải
-            if x1 < 450 and x2 > rm + 18:
-                target_r = rm + 6
-                for right_i, left_i in [(1, 0), (2, 3)]:
-                    dx = pts[right_i, 0] - pts[left_i, 0]
-                    if dx > 10:
-                        ratio = (target_r - pts[left_i, 0]) / dx
-                        pts[right_i, 0] = target_r
-                        pts[right_i, 1] = pts[left_i, 1] + ratio * (pts[right_i, 1] - pts[left_i, 1])
+            # Chỉ lọc lề phải viết tay khi trang là trang sách in dày đặc (is_book_page)
+            if is_book_page:
+                if x1 > rm - 65 and bw < 220:
+                    continue
+                if x1 < 450 and x2 > rm + 18:
+                    target_r = rm + 6
+                    for right_i, left_i in [(1, 0), (2, 3)]:
+                        dx = pts[right_i, 0] - pts[left_i, 0]
+                        if dx > 10:
+                            ratio = (target_r - pts[left_i, 0]) / dx
+                            pts[right_i, 0] = target_r
+                            pts[right_i, 1] = pts[left_i, 1] + ratio * (pts[right_i, 1] - pts[left_i, 1])
 
             h_box = float(max(np.linalg.norm(pts[0] - pts[3]), np.linalg.norm(pts[1] - pts[2])))
-            raw_items.append((ym, pts, h_box))
+            raw_items.append((ym, x1, pts, h_box))
             heights.append(h_box)
 
         if not raw_items:
             return []
 
         median_h = float(np.median(heights)) if heights else 55.0
-        raw_items.sort(key=lambda x: x[0])
+        raw_items.sort(key=lambda x: (round(x[0] / max(10.0, median_h * 0.45)), x[1]))
 
         final_polys = []
         final_pieces = []
-        final_ys = []
+        final_boxes_yx = []  # list of (sub_y, sx1, sx2)
 
-        for ym, pts, _ in raw_items:
+        for ym, _, pts, _ in raw_items:
             crop = _rotate_crop(img, pts)
             ch, cw = crop.shape[:2]
-            if ch > median_h * 1.65:
+            if ch < 6 or cw < 6 or ch > cw * 2.5:
+                continue
+            if ch > median_h * 1.65 and cw > 20 and int(ch * 0.70) > int(ch * 0.30) + 2:
                 gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
                 _, ink = cv2.threshold(gray, 0, 1, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-                row_proj = ink[:, int(cw * 0.05):int(cw * 0.95)].sum(axis=1)
+                x_lo, x_hi = max(0, int(cw * 0.05)), max(int(cw * 0.05) + 1, int(cw * 0.95))
+                row_proj = ink[:, x_lo:x_hi].sum(axis=1)
                 lo, hi = int(ch * 0.30), int(ch * 0.70)
                 split_y = lo + int(np.argmin(row_proj[lo:hi]))
                 r = float(split_y) / max(1.0, float(ch))
@@ -351,9 +365,23 @@ class OCREngine:
                 parts = [(ym, pts, crop)]
 
             for sub_y, sub_poly, sub_crop in parts:
-                if any(abs(sub_y - ey) < median_h * 0.42 for ey in final_ys):
+                sch, scw = sub_crop.shape[:2]
+                if sch < 6 or scw < 6 or sch > scw * 3.0:
                     continue
-                final_ys.append(sub_y)
+                sxs = sub_poly[:, 0]
+                sx1, sx2 = float(min(sxs)), float(max(sxs))
+                sw = max(1.0, sx2 - sx1)
+                is_dup = False
+                for ey, ex1, ex2 in final_boxes_yx:
+                    if abs(sub_y - ey) < median_h * 0.42:
+                        ew = max(1.0, ex2 - ex1)
+                        x_overlap = min(sx2, ex2) - max(sx1, ex1)
+                        if x_overlap > 0.45 * min(sw, ew):
+                            is_dup = True
+                            break
+                if is_dup:
+                    continue
+                final_boxes_yx.append((sub_y, sx1, sx2))
                 final_polys.append(sub_poly)
                 final_pieces.append(Image.fromarray(cv2.cvtColor(sub_crop, cv2.COLOR_BGR2RGB)))
 
@@ -560,44 +588,111 @@ class OCREngine:
 
     def _run_fallback_ocr(self, img: np.ndarray, page_number: int, width: int, height: int) -> dict:
         """
-        Engine dự phòng khi PaddleOCR chưa sẵn sàng.
-        Tạo layout nhận dạng sơ bộ với tọa độ chuẩn.
+        Engine dự phòng thực tế (Tesseract OCR tiếng Việt) khi PaddleOCR gặp sự cố.
+        Tuyệt đối không sinh văn bản mẫu giả lập.
         """
-        w = max(width, 800)
-        h = max(height, 1200)
+        blocks = []
+        try:
+            import pytesseract
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img.ndim == 3 else img
+            data = pytesseract.image_to_data(rgb, lang="vie", output_type=pytesseract.Output.DICT)
+            lines: dict[tuple[int, int, int], list[tuple[int, int, int, int, str, float]]] = {}
+            n_boxes = len(data.get("text", []))
+            for i in range(n_boxes):
+                txt = (data["text"][i] or "").strip()
+                conf = float(data["conf"][i]) if str(data["conf"][i]).replace(".", "", 1).lstrip("-").isdigit() else -1.0
+                if not txt or conf < 20:
+                    continue
+                key = (int(data["block_num"][i]), int(data["par_num"][i]), int(data["line_num"][i]))
+                x, y, bw, bh = int(data["left"][i]), int(data["top"][i]), int(data["width"][i]), int(data["height"][i])
+                lines.setdefault(key, []).append((x, y, x + bw, y + bh, txt, conf / 100.0))
 
-        blocks = [
-            {
-                "id": f"fb-1-{uuid.uuid4().hex[:6]}",
-                "type": "heading",
+            for order, items in enumerate(lines.values(), start=1):
+                x1 = max(0, min(it[0] for it in items))
+                y1 = max(0, min(it[1] for it in items))
+                x2 = min(width, max(it[2] for it in items))
+                y2 = min(height, max(it[3] for it in items))
+                line_text = normalize_vietnamese_text(" ".join(it[4] for it in items)).strip()
+                if not line_text:
+                    continue
+                avg_conf = float(np.mean([it[5] for it in items]))
+                blocks.append({
+                    "id": f"b-{order}-{uuid.uuid4().hex[:6]}",
+                    "type": "paragraph",
+                    "order": len(blocks) + 1,
+                    "bbox": [x1, y1, max(x1 + 1, x2), max(y1 + 1, y2)],
+                    "text": line_text,
+                    "confidence": round(avg_conf, 3),
+                })
+        except Exception as exc:
+            LOG.warning("Local Tesseract không khả dụng (%s), thử chạy qua Docker Tesseract engine...", exc)
+            try:
+                import subprocess
+                _, enc = cv2.imencode(".png", img)
+                tsv_out = None
+                for cname in ["docforge-tesseract-engine", "pbl4-doc_forge-backend-ai-worker-1"]:
+                    res = subprocess.run(
+                        ["docker", "exec", "-i", cname, "tesseract", "stdin", "stdout", "-l", "vie", "tsv"],
+                        input=enc.tobytes(),
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    if res.returncode == 0 and res.stdout:
+                        tsv_out = res.stdout.decode("utf-8", errors="ignore")
+                        break
+                if tsv_out:
+                    tsv_lines: dict[tuple[int, int, int], list[tuple[int, int, int, int, str, float]]] = {}
+                    rows = tsv_out.strip().splitlines()
+                    if len(rows) > 1:
+                        header = rows[0].split("\t")
+                        for r in rows[1:]:
+                            cols = r.split("\t")
+                            if len(cols) >= 12:
+                                txt = cols[11].strip()
+                                try:
+                                    conf = float(cols[10])
+                                except ValueError:
+                                    conf = -1.0
+                                if not txt or conf < 20:
+                                    continue
+                                b_num, p_num, l_num = int(cols[2]), int(cols[3]), int(cols[4])
+                                x, y, bw, bh = int(cols[6]), int(cols[7]), int(cols[8]), int(cols[9])
+                                tsv_lines.setdefault((b_num, p_num, l_num), []).append((x, y, x + bw, y + bh, txt, conf / 100.0))
+
+                    for order, items in enumerate(tsv_lines.values(), start=1):
+                        x1 = max(0, min(it[0] for it in items))
+                        y1 = max(0, min(it[1] for it in items))
+                        x2 = min(width, max(it[2] for it in items))
+                        y2 = min(height, max(it[3] for it in items))
+                        line_text = normalize_vietnamese_text(" ".join(it[4] for it in items)).strip()
+                        if not line_text:
+                            continue
+                        avg_conf = float(np.mean([it[5] for it in items]))
+                        blocks.append({
+                            "id": f"b-{order}-{uuid.uuid4().hex[:6]}",
+                            "type": "paragraph",
+                            "order": len(blocks) + 1,
+                            "bbox": [x1, y1, max(x1 + 1, x2), max(y1 + 1, y2)],
+                            "text": line_text,
+                            "confidence": round(avg_conf, 3),
+                        })
+            except Exception as dock_exc:
+                LOG.error("Fallback Docker Tesseract cũng gặp lỗi: %s", dock_exc)
+
+        if not blocks:
+            blocks.append({
+                "id": f"b-1-{uuid.uuid4().hex[:6]}",
+                "type": "paragraph",
                 "order": 1,
-                "bbox": [50, 50, int(w * 0.8), 110],
-                "text": "DOC FORGE — KẾT QUẢ XỬ LÝ AI REAL WORKER",
-                "confidence": 0.98,
-            },
-            {
-                "id": f"fb-2-{uuid.uuid4().hex[:6]}",
-                "type": "paragraph",
-                "order": 2,
-                "bbox": [50, 130, int(w * 0.9), 220],
-                "text": "Ảnh đã được chạy qua OpenCV ImagePreprocessor (Deskew, Denoise, CLAHE). "
-                        "Hệ thống sẵn sàng nhận dữ liệu từ PaddleOCR khi cài đặt mô hình.",
-                "confidence": 0.96,
-            },
-            {
-                "id": f"fb-3-{uuid.uuid4().hex[:6]}",
-                "type": "paragraph",
-                "order": 3,
-                "bbox": [50, 240, int(w * 0.9), 320],
-                "text": f"Thông tin trang: Trang số {page_number}, Kích thước {width}x{height} px.",
-                "confidence": 0.95,
-            },
-        ]
+                "bbox": [10, 10, max(11, width - 10), min(height, 50)],
+                "text": "[Trang không có nội dung chữ nhận dạng được]",
+                "confidence": 0.0,
+            })
 
         return {
             "schemaVersion": 1,
             "pageNumber": page_number,
-            "width": w,
-            "height": h,
+            "width": width,
+            "height": height,
             "blocks": blocks,
         }

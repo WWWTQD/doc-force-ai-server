@@ -1,8 +1,9 @@
 """
 Real AI Worker cho Doc Forge.
 
-Tích hợp OpenCV ImagePreprocessor và PaddleOCR (hoặc OCREngine)
-để xử lý ảnh thực tế từ Backend. Đồng thời xử lý Job dạng EXPORT.
+Tích hợp DocumentScanner, OpenCV ImagePreprocessor, DocumentRestorationUNet
+và OCREngine (YOLO Layout + PaddleOCR + VietOCR) để xử lý ảnh thực tế từ Backend.
+Đồng thời xử lý Job dạng EXPORT.
 
 Vòng lặp:
   1. POST /api/worker/jobs/claim
@@ -10,8 +11,9 @@ Vòng lặp:
        - Tải ảnh gốc: GET /api/worker/jobs/{id}/pages/{pageId}/original  (+ X-Lease-Token)
        - Phát hiện tờ giấy (YOLO document_detector.pt) -> nắn phẳng -> xoay đúng chiều
        - Tiền xử lý (OpenCV Deskew, Denoise, Magic Color khử bóng)
-       - Phân tích bố cục (YOLO layout_best_backup.pt) + nhận dạng chữ (PaddleOCR)
-       - (Tuỳ chọn) ghi ảnh phục hồi vào SHARED_STORAGE_ROOT, nếu không thì ánh xạ bbox về ảnh gốc
+       - Khôi phục chất lượng ảnh bằng DocumentRestorationUNet (làm trắng nền & rõ nét chữ)
+       - Upload ảnh đã khôi phục lên Backend (/restored) hoặc lưu vào SHARED_STORAGE_ROOT
+       - Phân tích bố cục (YOLO layout_best_backup.pt) + nhận dạng chữ (PaddleOCR + VietOCR) trên chính ảnh đã khôi phục
        - POST /api/worker/jobs/{id}/results
   3. Nếu job type == "EXPORT":
        - Tải snapshot JSON: GET /api/worker/jobs/{id}/snapshot           (+ X-Lease-Token)
@@ -32,6 +34,14 @@ import tempfile
 import threading
 import time
 
+# Đảm bảo import được các module từ root và worker
+WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(WORKER_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+if WORKER_DIR not in sys.path:
+    sys.path.insert(0, WORKER_DIR)
+
 # Cấu hình logging chuẩn ra stdout
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
@@ -45,6 +55,8 @@ LOG = logging.getLogger("real_worker")
 LOG.setLevel(logging.INFO)
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["FLAGS_enable_pir_api"] = "0"
 try:
     import torch
 except Exception:
@@ -90,7 +102,8 @@ HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "20"))
 SHARED_STORAGE_ROOT = os.environ.get("SHARED_STORAGE_ROOT", "").strip()
 ENABLE_MAGIC_FILTER = os.environ.get("ENABLE_MAGIC_FILTER", "false").lower() == "true"
 ENABLE_DOCUMENT_SCAN = os.environ.get("ENABLE_DOCUMENT_SCAN", "true").lower() != "false"
-PIPELINE_VERSION = "real-worker-docscan-paddleocr-v2.0"
+ENABLE_IMAGE_RESTORATION = os.environ.get("ENABLE_IMAGE_RESTORATION", "true").lower() != "false"
+PIPELINE_VERSION = "real-worker-unet-docscan-paddleocr-v2.1"
 
 STOP = threading.Event()
 
@@ -183,6 +196,25 @@ def _claim_job() -> dict | None:
         raise
 
 
+def _upload_restored(job_id: str, page_id: str, lease_token: str, image_bytes: bytes, timeout: int = 30) -> str | None:
+    """Upload ảnh đã được U-Net làm sạch lên Backend (/restored) để lấy restoredImageKey."""
+    url = f"{BACKEND_URL}/api/worker/jobs/{job_id}/pages/{page_id}/restored"
+    headers = _base_headers(lease_token)
+    files = {"file": ("restored.jpg", io.BytesIO(image_bytes), "image/jpeg")}
+    try:
+        resp = requests.post(url, files=files, headers=headers, timeout=timeout)
+        if resp.ok:
+            data = resp.json()
+            key = data.get("storageKey")
+            if key:
+                LOG.info("  ✓ Đã upload ảnh restored qua API (/restored): %s", key)
+                return key
+        LOG.warning("  Upload ảnh restored trang %s trả về HTTP %d: %s", page_id, resp.status_code, resp.text)
+    except Exception as exc:
+        LOG.warning("  Lỗi kết nối khi upload ảnh restored qua API (trang %s): %s", page_id, exc)
+    return None
+
+
 def _sync_to_docker_backend(local_path: str, storage_key: str):
     """
     Nếu Spring Boot Backend đang chạy trong Docker container (ceabf1005847 / pbl4-doc_forge-backend-app-1),
@@ -211,10 +243,29 @@ def _sync_to_docker_backend(local_path: str, storage_key: str):
 
 def _save_restored_image(job: dict, page_id: str, img) -> str | None:
     """
-    Ghi ảnh phục hồi vào storage dùng chung theo đúng key Backend chấp nhận:
-    documents/{documentId}/jobs/{jobId}/{leaseToken}/pages/{pageId}/restored.jpg
+    1. Ưu tiên upload ảnh đã được U-Net làm sạch lên Backend qua POST /api/worker/jobs/{jobId}/pages/{pageId}/restored.
+    2. Fallback: Ghi ảnh phục hồi vào storage dùng chung theo đúng key Backend chấp nhận:
+       documents/{documentId}/jobs/{jobId}/{leaseToken}/pages/{pageId}/restored.jpg
     Trả về storage key, hoặc None nếu không ghi được.
     """
+    try:
+        ok, encoded = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if not ok:
+            raise ValueError("Không encode được ảnh phục hồi")
+        image_bytes = encoded.tobytes()
+    except Exception as exc:
+        LOG.warning("  Không encode được ảnh phục hồi: %s", exc)
+        return None
+
+    # Bước 1: Upload trực tiếp qua HTTP API (/restored) của Backend
+    job_id = job.get("jobId")
+    lease_token = job.get("leaseToken")
+    if job_id and lease_token:
+        uploaded_key = _upload_restored(job_id, page_id, lease_token, image_bytes)
+        if uploaded_key:
+            return uploaded_key
+
+    # Bước 2: Fallback ghi vào SHARED_STORAGE_ROOT / docker cp
     if not job.get("documentId"):
         return None
     key = (f"documents/{job['documentId']}/jobs/{job['jobId']}/{job['leaseToken']}"
@@ -227,13 +278,10 @@ def _save_restored_image(job: dict, page_id: str, img) -> str | None:
 
     target = os.path.join(root, *key.split("/"))
     try:
-        ok, encoded = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        if not ok:
-            raise ValueError("Không encode được ảnh phục hồi")
         os.makedirs(os.path.dirname(target), exist_ok=True)
         temp = target + ".tmp"
         with open(temp, "wb") as fh:
-            fh.write(encoded.tobytes())
+            fh.write(image_bytes)
         os.replace(temp, target)
 
         # Đồng bộ sang Docker backend container nếu backend đang chạy qua docker-compose
@@ -270,12 +318,32 @@ def _process_ocr_job(job: dict, pipeline: ScanPipeline):
                 lease_token=lease_token,
             )
 
-            # 1. Bắt tờ giấy + nắn phẳng + xoay -> 2. Deskew/Denoise/Magic Color -> 3. Layout + OCR
-            LOG.info("  -> Scan tài liệu (detect, warp, orient, enhance) + OCR...")
+            # 1. Bắt tờ giấy + nắn phẳng + xoay -> 2. Deskew/Denoise/Magic Color -> 3. U-Net Restoration -> 4. Layout + OCR
+            LOG.info("  -> Scan tài liệu (detect, warp, orient, enhance) + U-Net Restoration + OCR...")
             result = pipeline.process_bytes(image_bytes, page_number)
 
-            # Có ảnh phục hồi -> giữ toạ độ theo ảnh đó; không có -> ánh xạ bbox về ảnh gốc
+            # Upload ảnh phục hồi lên Backend (/restored) -> giữ toạ độ theo ảnh đó; nếu không có -> ánh xạ bbox về ảnh gốc
             restored_key = _save_restored_image(job, page_id, result.restored_image)
+            if result.geometry.rotation in (90, 180, 270) and job.get("documentId"):
+                try:
+                    ok_orig, enc_orig = cv2.imencode(".jpg", result.geometry.image, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                    if ok_orig:
+                        orig_key = f"documents/{job['documentId']}/pages/{page_id}/original.jpg"
+                        tmp_orig = os.path.join(tempfile.gettempdir(), f"rotated_orig_{page_id}.jpg")
+                        with open(tmp_orig, "wb") as f_orig:
+                            f_orig.write(enc_orig.tobytes())
+                        _sync_to_docker_backend(tmp_orig, orig_key)
+                        rh, rw = result.restored_image.shape[:2]
+                        subprocess.run(
+                            [
+                                "docker", "exec", "pbl4-doc_forge-backend-db-1",
+                                "psql", "-U", "docforge", "-d", "docforge", "-c",
+                                f"UPDATE document_pages SET width = {int(rw)}, height = {int(rh)} WHERE id = '{page_id}';",
+                            ],
+                            capture_output=True, timeout=5,
+                        )
+                except Exception as exc_orig:
+                    LOG.debug("Không thể đồng bộ ảnh gốc đã xoay: %s", exc_orig)
             layout_json = result.layout if restored_key else result.layout_in_original_coords()
 
             page_results.append({
@@ -503,18 +571,33 @@ def _try_fail(job_id: str, lease_token: str, error_code: str, error_message: str
 
 def main():
     print("╔══════════════════════════════════════╗", flush=True)
-    print("║   Doc Forge — Real AI Worker v1.2    ║", flush=True)
+    print("║   Doc Forge — Real AI Worker v1.3    ║", flush=True)
     print("╚══════════════════════════════════════╝", flush=True)
     print(f"Backend URL  : {BACKEND_URL}", flush=True)
     print(f"Worker ID    : {WORKER_INSTANCE_ID}", flush=True)
     print(f"Poll interval: {POLL_INTERVAL:.0f}s\n", flush=True)
+
+    # Khởi tạo DocumentRestorationUNet
+    restoration_service = None
+    if ENABLE_IMAGE_RESTORATION:
+        try:
+            from app.services.restoration_service import RestorationService
+            restoration_service = RestorationService.get_instance()
+            if restoration_service.is_available:
+                LOG.info("✓ DocumentRestorationUNet đã sẵn sàng!")
+            else:
+                LOG.warning("DocumentRestorationUNet chưa có trọng số khả dụng.")
+        except Exception as exc:
+            LOG.warning("Không thể khởi tạo RestorationService: %s", exc)
 
     preprocessor = ImagePreprocessor(enable_magic=ENABLE_MAGIC_FILTER)
     ocr_engine = OCREngine(lang="vi")
     pipeline = ScanPipeline(
         ocr_engine=ocr_engine,
         preprocessor=preprocessor,
+        restoration_service=restoration_service,
         enable_document_scan=ENABLE_DOCUMENT_SCAN,
+        enable_restoration=ENABLE_IMAGE_RESTORATION,
     )
 
     # Đảm bảo logging ra console không bị Ultralytics hay PaddleOCR đè level

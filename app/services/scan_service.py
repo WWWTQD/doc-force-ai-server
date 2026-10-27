@@ -17,6 +17,8 @@ from app.services.ocr_service import OCRService
 from app.services.quality_service import QualityService
 from app.services.document_service import DocumentService
 from app.services.defect_service import DefectService
+from app.services.restoration_service import RestorationService
+from app.core.config import settings
 
 from app.core.logging import Timer
 
@@ -34,6 +36,7 @@ class ScanService:
         3. Analyze image quality
         4. Detect defects
         5. Extract / preprocess document
+        5.1 Restore image with DocumentRestorationUNet
         6. OCR
         7. Save processed image
         8. Build and save scan result
@@ -45,6 +48,7 @@ class ScanService:
         self.quality_service = QualityService()
         self.document_service = DocumentService()
         self.defect_service = DefectService()
+        self.restoration_service = RestorationService.get_instance()
 
     async def process_scan(self, scan_id: str, upload_file) -> ScanResult:
         timer = Timer()
@@ -79,6 +83,22 @@ class ScanService:
             content,
             doc_info
         )
+
+        # ============================================================
+        # 5.1 Document Image Restoration (DocumentRestorationUNet)
+        # ============================================================
+        if settings.ENABLE_IMAGE_RESTORATION and self.restoration_service.is_available:
+            try:
+                processed_bytes = self.restoration_service.restore_image_bytes(
+                    processed_bytes,
+                    tile_size=settings.RESTORATION_TILE_SIZE,
+                    overlap=settings.RESTORATION_OVERLAP,
+                    preserve_color=settings.RESTORATION_PRESERVE_COLOR,
+                )
+            except Exception as ex:
+                logger.warning(
+                    "Document restoration failed: %s. Proceeding with cropped image.", ex
+                )
 
         # ============================================================
         # 6. OCR

@@ -275,17 +275,32 @@ class DocumentScanner:
     # ── Bước 3: xoay đúng chiều ──────────────────────────────────────────────
     def orient(self, img: np.ndarray) -> int:
         """Trả về góc cần xoay theo chiều kim đồng hồ (0/90/180/270)."""
-        candidates = [90, 270] if text_axis_is_vertical(img) else [0, 180]
+        h, w = img.shape[:2]
+        if text_axis_is_vertical(img):
+            candidates = [90, 270]
+        elif w > h * 1.1:
+            # Ảnh nằm ngang (landscape) như tài liệu chụp ngang điện thoại: ưu tiên kiểm tra 90°, 270° và 0°
+            candidates = [90, 270, 0]
+        else:
+            candidates = [0, 180]
+
         if self.orientation_scorer is None:
             return candidates[0]
 
         try:
-            first = self.orientation_scorer(rotate_image(img, candidates[0]))
-            if first >= 0.85:  # đọc rất tốt ở hướng đầu tiên -> khỏi thử hướng ngược
-                return candidates[0]
-            second = self.orientation_scorer(rotate_image(img, candidates[1]))
-            LOG.info("Orientation score: %d°=%.3f, %d°=%.3f", candidates[0], first, candidates[1], second)
-            return candidates[1] if second > first + 0.05 else candidates[0]
+            best_rot = candidates[0]
+            best_score = self.orientation_scorer(rotate_image(img, best_rot))
+            if best_score >= 0.85:  # đọc rất tốt ở hướng đầu tiên -> khỏi thử hướng ngược
+                return best_rot
+            scores = {best_rot: best_score}
+            for cand in candidates[1:]:
+                sc = self.orientation_scorer(rotate_image(img, cand))
+                scores[cand] = sc
+                if sc > best_score + 0.05:
+                    best_score = sc
+                    best_rot = cand
+            LOG.info("Orientation score: %s -> chọn %d°", scores, best_rot)
+            return best_rot
         except Exception as exc:
             LOG.warning("Orientation scorer lỗi: %s — giữ hướng %d°", exc, candidates[0])
             return candidates[0]

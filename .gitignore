@@ -4,7 +4,13 @@ __pycache__/
 
 # Virtual environment
 .venv/
+.venv311/
 venv/
+
+# Archives
+*.zip
+*.tar.gz
+*.rar
 
 # Environment
 .env
@@ -15,11 +21,25 @@ venv/
 *.iml
 
 # AI models
-models/
+models/*
+!models/README.md
+!models/training_log.json
+!models/restoration_best.pth
 *.pth
+!models/restoration_best.pth
 *.pt
+!worker/Model/best.pt
 *.onnx
 *.safetensors
+
+# Datasets & evaluation
+eval_results/
+datasets/
+datasets/images/
+datasets/original/
+datasets/processed/
+datasets/real/
+datasets/synthetic/
 
 # Upload/output & test scans
 uploads/
@@ -31,6 +51,8 @@ latest_doc/
 *.jpeg
 *.png
 *.bmp
+*.jfif
+*.webp
 test_restored.jpg
 test_layout.json
 
@@ -42,11 +64,11 @@ firmware/
 
 # Logs
 *.log
-
+worker_live*.log
 
 # OS
+.DS_Store
+Thumbs.db
 
 # Local AI reference (not for GitHub)
 LOCAL_AI_STATUS.md
-.DS_Store
-Thumbs.db
