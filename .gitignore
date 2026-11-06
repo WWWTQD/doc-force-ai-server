@@ -7,14 +7,17 @@ __pycache__/
 .venv311/
 venv/
 
-# Archives
-*.zip
-*.tar.gz
-*.rar
-
 # Environment
 .env
 .env.*
+.env.local_backup
+
+# Archives & Large Colab datasets
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
 
 # IntelliJ IDEA
 .idea/
@@ -22,39 +25,29 @@ venv/
 
 # AI models
 models/*
-!models/README.md
-!models/training_log.json
-!models/restoration_best.pth
 *.pth
-!models/restoration_best.pth
 *.pt
-!worker/Model/best.pt
 *.onnx
 *.safetensors
+!models/restoration_best.pth
+!models/README.md
+!models/training_log.json
+!worker/Model/best.pt
 
-# Datasets & evaluation
-eval_results/
-datasets/
+# Datasets raw images (only keep metadata & README)
 datasets/images/
 datasets/original/
 datasets/processed/
 datasets/real/
 datasets/synthetic/
+datasets/clean_originals/
+datasets/raw_docs/
 
-# Upload/output & test scans
+# Upload/output
 uploads/
 outputs/
 data/input/
 data/output/
-latest_doc/
-*.jpg
-*.jpeg
-*.png
-*.bmp
-*.jfif
-*.webp
-test_restored.jpg
-test_layout.json
 
 # Firmware (may contain WiFi credentials/device keys)
 firmware/
@@ -64,7 +57,6 @@ firmware/
 
 # Logs
 *.log
-worker_live*.log
 
 # OS
 .DS_Store
@@ -72,3 +64,6 @@ Thumbs.db
 
 # Local AI reference (not for GitHub)
 LOCAL_AI_STATUS.md
+
+# Experiment evaluation output
+eval_results/

@@ -133,17 +133,27 @@ class ScanPipeline:
         else:
             geometry = ScanGeometry(image=img, transform=np.eye(3), original_size=(w, h), method="disabled")
 
-        restored, deskew_matrix = self.preprocessor.enhance(geometry.image)
-        transform = deskew_matrix @ geometry.transform
-
-        # Đưa qua mô hình DocumentRestorationUNet của mình trước khi vào Model Nhận diện chữ của manoi
-        if (
+        use_unet = (
             self.enable_restoration
             and self.restoration_service is not None
             and getattr(self.restoration_service, "is_available", False)
-        ):
+        )
+
+        if use_unet:
+            # Khi có DocumentRestorationUNet v5: chỉ xoay thẳng hình học (deskew),
+            # giữ nguyên phân bố pixel tự nhiên đưa vào U-Net v5 (tránh bị bilateralFilter/CLAHE làm nhòe nét hoặc tăng nhiễu nền)
+            if getattr(self.preprocessor, "enable_deskew", True):
+                try:
+                    restored, deskew_matrix = self.preprocessor.deskew_with_matrix(geometry.image)
+                except Exception as exc:
+                    LOG.warning("Lỗi khi deskew ảnh: %s", exc)
+                    restored, deskew_matrix = geometry.image, np.eye(3, dtype=np.float64)
+            else:
+                restored, deskew_matrix = geometry.image, np.eye(3, dtype=np.float64)
+            transform = deskew_matrix @ geometry.transform
+
             try:
-                LOG.info("  -> Khôi phục ảnh bằng DocumentRestorationUNet (tile=512, overlap=64)...")
+                LOG.info("  -> Khôi phục ảnh bằng DocumentRestorationUNet v5 (tile=512, overlap=64)...")
                 restored_h, restored_w = restored.shape[:2]
                 unet_restored = self.restoration_service.restore_image_bgr(
                     restored,
@@ -160,7 +170,12 @@ class ScanPipeline:
                     )
                 restored = unet_restored
             except Exception as exc:
-                LOG.warning("  Cảnh báo: Khôi phục ảnh U-Net gặp lỗi (%s), tiếp tục với ảnh tiền xử lý.", exc)
+                LOG.warning("  Cảnh báo: Khôi phục ảnh U-Net v5 gặp lỗi (%s), fallback sang ImagePreprocessor.", exc)
+                restored, deskew_matrix = self.preprocessor.enhance(geometry.image)
+                transform = deskew_matrix @ geometry.transform
+        else:
+            restored, deskew_matrix = self.preprocessor.enhance(geometry.image)
+            transform = deskew_matrix @ geometry.transform
 
         layout = self.ocr_engine.process_image(restored, page_number)
         layout["scan"] = geometry.to_metadata()

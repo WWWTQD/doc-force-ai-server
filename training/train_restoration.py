@@ -1,9 +1,34 @@
-import os
-import sys
+"""
+Document Image Restoration Model Training Script (U-Net v5).
+
+Architecture (DocumentRestorationUNet v5):
+- Multi-Scale Robust Input (3 channels): [x, x_norm_robust_31, x_norm_robust_101] with 3x3 median pre-filtering
+- Internal layers: GroupNorm (8 groups) throughout, replacing BatchNorm to eliminate tile brightness shifts
+- Bilinear Upsampling + Conv3x3 (up3, up2, up1) replacing ConvTranspose2d to eliminate checkerboard artifacts
+- Bottleneck: 1 ResidualBlock(512) followed by ASPP(512) with dilations 1, 2, 4, 8 + Global Average Pooling
+- Selective Skip Connections: AttentionGate on levels 2 and 3; direct skip connection on level 1 to preserve 100% fine accents
+- Logit-Space Residual Output Head: delta = out_conv(d1), output = sigmoid(logit(clamp(x_norm_robust_31)) + delta)
+  with zero weight/bias initialization so training starts cleanly at the normalized state.
+
+Loss (DocumentCleanLoss):
+- Weighted Charbonnier Loss (1.0)
+- Multi-Scale Sobel Edge Gradient Loss (0.8)
+- SSIM Loss (0.2)
+- Asymmetric Stroke Darkening Loss (0.25)
+- Bleed-Through Suppression Loss (0.15)
+- FFT Frequency L1 Loss (0.05)
+"""
+
+from __future__ import annotations
+
 import argparse
-import math
 import json
 import logging
+import math
+import os
+import sys
+from typing import Dict, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,30 +42,133 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("train_restoration")
 
 
+# ==============================================================================
+# ARCHITECTURAL BLOCKS (U-Net v5)
+# ==============================================================================
+
 class ResidualBlock(nn.Module):
-    """Residual block with two 3x3 convolutions and skip connection."""
+    """Residual block with two 3x3 convolutions and GroupNorm (8 groups)."""
 
     def __init__(self, channels: int):
         super().__init__()
+        num_groups = min(8, channels)
         self.conv = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
+            nn.GroupNorm(num_groups=num_groups, num_channels=channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
+            nn.GroupNorm(num_groups=num_groups, num_channels=channels),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.conv(x)
 
 
+class AttentionGate(nn.Module):
+    """
+    Attention Gate (Oktay et al., 2018):
+    Filters background noise and back-side bleed-through before skip connections.
+    F_g: channels of gating signal from decoder
+    F_l: channels of skip connection from encoder
+    F_int: intermediate channel dimension
+    """
+
+    def __init__(self, F_g: int, F_l: int, F_int: int):
+        super().__init__()
+        num_groups = min(8, F_int)
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups=num_groups, num_channels=F_int),
+        )
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups=num_groups, num_channels=F_int),
+        )
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        psi = self.relu(g1 + x1)
+        alpha = self.psi(psi)
+        return x * alpha
+
+
+class ASPP(nn.Module):
+    """
+    Atrous Spatial Pyramid Pooling for multi-receptive field context in the bottleneck.
+    Dilations: 1, 2, 4, 8 + Global Average Pooling.
+    """
+
+    def __init__(self, in_channels: int = 512, out_channels: int = 512):
+        super().__init__()
+        branch_ch = 128
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, branch_ch, kernel_size=1, bias=False),
+            nn.GroupNorm(8, branch_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(in_channels, branch_ch, kernel_size=3, padding=1, dilation=1, bias=False),
+            nn.GroupNorm(8, branch_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(in_channels, branch_ch, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.GroupNorm(8, branch_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(in_channels, branch_ch, kernel_size=3, padding=4, dilation=4, bias=False),
+            nn.GroupNorm(8, branch_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.conv5 = nn.Sequential(
+            nn.Conv2d(in_channels, branch_ch, kernel_size=3, padding=8, dilation=8, bias=False),
+            nn.GroupNorm(8, branch_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.global_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Conv2d(in_channels, branch_ch, kernel_size=1, bias=False),
+            nn.GroupNorm(8, branch_ch),
+            nn.ReLU(inplace=True),
+        )
+        total_in = branch_ch * 6
+        self.project = nn.Sequential(
+            nn.Conv2d(total_in, out_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(8, out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h, w = x.shape[2], x.shape[3]
+        f1 = self.conv1(x)
+        f2 = self.conv2(x)
+        f3 = self.conv3(x)
+        f4 = self.conv4(x)
+        f5 = self.conv5(x)
+        gp = self.global_pool(x)
+        gp_up = F.interpolate(gp, size=(h, w), mode="bilinear", align_corners=False)
+        cat = torch.cat([f1, f2, f3, f4, f5, gp_up], dim=1)
+        return self.project(cat)
+
+
+# ==============================================================================
+# LOSS FUNCTIONS
+# ==============================================================================
+
 class SobelLoss(nn.Module):
     """Multi-Scale Sobel Gradient Loss to enforce sharp text edge reconstruction across scales."""
 
     def __init__(self):
         super().__init__()
-        sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], dtype=torch.float32).view(1, 1, 3, 3)
-        sobel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_x = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], dtype=torch.float32).view(1, 1, 3, 3)
         self.register_buffer("sobel_x", sobel_x)
         self.register_buffer("sobel_y", sobel_y)
 
@@ -66,31 +194,6 @@ class SobelLoss(nn.Module):
             loss_scale2 = self._grad_l1(pred_half, target_half)
             return loss_scale1 + 0.5 * loss_scale2
         return loss_scale1
-
-
-class BimodalStrokeLoss(nn.Module):
-    """
-    Penalizes washed-out gray predictions on text strokes while preserving soft anti-aliased
-    target edges. Forces stroke cores to be crisp dark ink rather than muddy mid-gray.
-    """
-
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        pred = pred.float()
-        target = target.float()
-
-        # 1. Bimodal distribution alignment: match p * (1 - p) of the clean target
-        pred_bimodal = pred * (1.0 - pred)
-        target_bimodal = target * (1.0 - target)
-        loss_bimodal = F.l1_loss(pred_bimodal, target_bimodal)
-
-        # 2. Asymmetric stroke darkening penalty: penalize faded/gray predictions (pred > target) on stroke pixels
-        stroke_mask = (target < 0.65).float()
-        faded_stroke_penalty = torch.mean(stroke_mask * (F.relu(pred - target) ** 2))
-
-        return loss_bimodal + 2.0 * faded_stroke_penalty
 
 
 class SSIMLoss(nn.Module):
@@ -130,11 +233,29 @@ class SSIMLoss(nn.Module):
         return torch.clamp(1.0 - ssim_map.mean(), min=0.0)
 
 
+class AsymmetricStrokeDarkeningLoss(nn.Module):
+    """
+    Asymmetric stroke darkening penalty:
+    Penalizes faded or gray predictions (pred > target) specifically on text stroke pixels
+    where target < target_thresh (default 0.70). Does NOT penalize dark strokes.
+    """
+
+    def __init__(self, target_thresh: float = 0.70):
+        super().__init__()
+        self.target_thresh = target_thresh
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred = pred.float()
+        target = target.float()
+        stroke_mask = (target < self.target_thresh).float()
+        faded_penalty = torch.mean(stroke_mask * (F.relu(pred - target) ** 2))
+        return faded_penalty
+
+
 class BleedThroughSuppressionLoss(nn.Module):
     """
-    Penalizes residual gray predictions (pred < 0.92) in regions where target > 0.95
+    Penalizes residual gray predictions (pred < pred_floor) in regions where target > target_thresh
     (pure white background or back-side bleed-through/watermark regions that must be erased).
-    Teaches U-Net to distinguish and suppress back-side bleed-through without affecting front strokes.
     """
 
     def __init__(self, target_thresh: float = 0.95, pred_floor: float = 0.92):
@@ -146,73 +267,94 @@ class BleedThroughSuppressionLoss(nn.Module):
         pred = pred.float()
         target = target.float()
         bg_or_bleed_mask = (target > self.target_thresh).float()
-        # Heavy quadratic penalty when U-Net predicts gray < 0.92 on clean background/bleed-through regions
         below_floor = F.relu(self.pred_floor - pred)
         white_gap = F.relu(target - pred)
         return torch.mean(bg_or_bleed_mask * (10.0 * (below_floor ** 2) + 0.5 * white_gap))
 
 
+class FFTLoss(nn.Module):
+    """Frequency-domain L1 loss using 2D Real FFT to preserve fine text texture and suppress noise grids."""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_fft = torch.fft.rfft2(pred.float(), norm="ortho")
+        target_fft = torch.fft.rfft2(target.float(), norm="ortho")
+        pred_mag = torch.abs(pred_fft)
+        target_mag = torch.abs(target_fft)
+        return F.l1_loss(pred_mag, target_mag)
+
+
 class DocumentCleanLoss(nn.Module):
+    """
+    Comprehensive Multi-Task Loss for Document Restoration (v5):
+    - Weighted Charbonnier Loss (1.0)
+    - Multi-Scale Sobel Gradient Edge Loss (0.8)
+    - Structural Similarity SSIM Loss (0.2)
+    - Asymmetric Stroke Darkening Loss (0.25)
+    - Bleed-Through Suppression Loss (0.15)
+    - FFT Frequency L1 Loss (0.05)
+    """
+
     def __init__(self):
         super().__init__()
         self.sobel = SobelLoss()
         self.ssim = SSIMLoss()
-        self.bimodal = BimodalStrokeLoss()
+        self.stroke_darkening = AsymmetricStrokeDarkeningLoss(target_thresh=0.70)
         self.bleed_suppression = BleedThroughSuppressionLoss(target_thresh=0.95, pred_floor=0.92)
+        self.fft_loss = FFTLoss()
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         pred = pred.float()
         target = target.float()
 
-        # Trọng số liên tục ưu tiên bảo vệ nét chữ (không ép 1.5x cho nền trắng để tránh over-bleaching)
+        # Weighted Charbonnier prioritizing stroke reconstruction
         stroke_weight = 1.0 + 6.0 * ((1.0 - target) ** 2)
-
-        # 1. Weighted Charbonnier Loss
         charbonnier = torch.sqrt((pred - target) ** 2 + 1e-6)
         loss_charbonnier = torch.mean(stroke_weight * charbonnier)
 
-        # 2. Weighted BCE Loss
-        pred_clamped = torch.clamp(pred, 1e-6, 1.0 - 1e-6)
-        bce_map = F.binary_cross_entropy(pred_clamped, target, reduction="none")
-        loss_bce = torch.mean(stroke_weight * bce_map)
-
-        # 3. Multi-Scale Sobel Edge Gradient Loss (0.8) để tái tạo sắc nét biên chữ khi mờ hoặc trong bóng râm
         loss_sobel = self.sobel(pred, target)
-
-        # 4. SSIM Loss (0.2) bảo toàn cấu trúc cục bộ của ký tự
         loss_ssim = self.ssim(pred, target)
-
-        # 5. BimodalStrokeLoss (0.25) phạt vùng chữ bị xám mờ, tăng tương phản nét chữ cho YOLOv8
-        loss_bimodal = self.bimodal(pred, target)
-
-        # 6. BleedThroughSuppressionLoss (0.35) phạt nặng nếu vùng target > 0.95 mà U-Net xuất < 0.92
+        loss_darkening = self.stroke_darkening(pred, target)
         loss_bleed = self.bleed_suppression(pred, target)
+        loss_fft = self.fft_loss(pred, target)
 
         total_loss = (
-            loss_charbonnier
-            + 0.3 * loss_bce
+            1.0 * loss_charbonnier
             + 0.8 * loss_sobel
             + 0.2 * loss_ssim
-            + 0.25 * loss_bimodal
-            + 0.35 * loss_bleed
+            + 0.25 * loss_darkening
+            + 0.15 * loss_bleed
+            + 0.05 * loss_fft
         )
         return total_loss
 
 
+# ==============================================================================
+# MODEL ARCHITECTURE: DocumentRestorationUNet (v5)
+# ==============================================================================
+
 class DocumentRestorationUNet(nn.Module):
     """
-    3-Stage U-Net architecture for Multi-Degradation Document Image Restoration.
-    Accepts [B, 1, H, W] input, computes internal Local Illumination Normalization `x_norm`,
-    concatenates `[x, x_norm]` into 2 channels for `enc1`, and uses Sigmoid output activation
-    with +0.2 bias init to preserve faint/blurred text strokes.
+    DocumentRestorationUNet v5:
+    - Multi-Scale Robust Input (3 channels): [x, x_norm_robust_31, x_norm_robust_101]
+    - GroupNorm(8) throughout internal layers (no batch-size dependence or tile illumination shifts)
+    - Bilinear Upsampling + Conv3x3 (no checkerboard artifacts)
+    - Bottleneck: 1 ResidualBlock(512) + ASPP(512)
+    - Selective Skip Connections: AttentionGate on levels 2 & 3; direct skip on level 1
+    - Logit-Space Residual Output Head: delta = out_conv(d1), y = sigmoid(logit(x_norm_31) + delta)
     """
 
     def __init__(self, in_channels: int = 1, out_channels: int = 1):
         super().__init__()
         self.in_channels = in_channels
-        enc_in_channels = in_channels * 2
+        self.out_channels = out_channels
 
-        # Encoder level 1 (receives concatenated [x, x_norm] -> 2 channels when in_channels=1)
+        # 3-channel input: [x, x_norm_robust_31, x_norm_robust_101]
+        enc_in_channels = in_channels * 3
+
+        # Encoder level 1
         self.enc1 = nn.Sequential(
             nn.Conv2d(enc_in_channels, 64, kernel_size=3, padding=1),
             ResidualBlock(64),
@@ -233,124 +375,182 @@ class DocumentRestorationUNet(nn.Module):
         )
         self.down3 = nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1)
 
-        # Bottleneck (512 channels at H/8, W/8)
+        # Bottleneck: 1 ResidualBlock + ASPP
         self.bottleneck = nn.Sequential(
             ResidualBlock(512),
-            ResidualBlock(512),
+            ASPP(512, 512),
         )
 
-        # Decoder level 3: upsample 512->256, concat with enc3 skip (256) = 512 channels
-        self.up3 = nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1)
+        # Decoder level 3 (Attention Gate on e3)
+        self.up3 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(512, 256, kernel_size=3, padding=1, bias=False),
+        )
+        self.att3 = AttentionGate(F_g=256, F_l=256, F_int=128)
         self.dec3 = nn.Sequential(
-            nn.Conv2d(256 + 256, 256, kernel_size=1),  # 1x1 conv: 512 -> 256
+            nn.Conv2d(256 + 256, 256, kernel_size=1),
             ResidualBlock(256),
             ResidualBlock(256),
         )
 
-        # Decoder level 2: upsample 256->128, concat with enc2 skip (128) = 256 channels
-        self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1)
+        # Decoder level 2 (Attention Gate on e2)
+        self.up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
+        )
+        self.att2 = AttentionGate(F_g=128, F_l=128, F_int=64)
         self.dec2 = nn.Sequential(
-            nn.Conv2d(128 + 128, 128, kernel_size=1),  # 1x1 conv: 256 -> 128
+            nn.Conv2d(128 + 128, 128, kernel_size=1),
             ResidualBlock(128),
             ResidualBlock(128),
         )
 
-        # Decoder level 1: upsample 128->64, concat with enc1 skip (64) = 128 channels
-        self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1)
+        # Decoder level 1 (Direct skip connection on e1 to preserve 100% fine accents)
+        self.up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False),
+        )
         self.dec1 = nn.Sequential(
-            nn.Conv2d(64 + 64, 64, kernel_size=1),  # 1x1 conv: 128 -> 64
+            nn.Conv2d(64 + 64, 64, kernel_size=1),
             ResidualBlock(64),
-            nn.Conv2d(64, out_channels, kernel_size=3, padding=1),
-            nn.Sigmoid(),  # Direct clean output in [0, 1]
         )
 
-        # Hạ khởi tạo bias của tầng Conv2d cuối cùng xuống +0.2 để tránh tẩy trắng nhầm chữ bị mờ
-        last_conv = self.dec1[-2]  # Lớp nn.Conv2d(64, out_channels, kernel_size=3, padding=1)
-        if hasattr(last_conv, "bias") and last_conv.bias is not None:
-            nn.init.constant_(last_conv.bias, 0.2)
+        # Logit-space residual head
+        self.out_conv = nn.Conv2d(64, out_channels, kernel_size=3, padding=1)
+        nn.init.zeros_(self.out_conv.weight)
+        if self.out_conv.bias is not None:
+            nn.init.zeros_(self.out_conv.bias)
+
+    @staticmethod
+    def _median_filter_3x3(x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        x_pad = F.pad(x, (1, 1, 1, 1), mode="reflect")
+        patches = F.unfold(x_pad, kernel_size=3, stride=1)
+        med = patches.median(dim=1).values.view(b, c, h, w)
+        return med
+
+    @staticmethod
+    def _get_norm_robust(x_med: torch.Tensor, x_raw: torch.Tensor, k: int) -> torch.Tensor:
+        pad = k // 2
+        x_pad = F.pad(x_med, (pad, pad, pad, pad), mode="reflect")
+        bg_max = F.max_pool2d(
+            F.max_pool2d(x_pad, kernel_size=(1, k), stride=1, padding=0),
+            kernel_size=(k, 1),
+            stride=1,
+            padding=0,
+        )
+        bg_pad = F.pad(bg_max, (pad, pad, pad, pad), mode="reflect")
+        bg_smooth = F.avg_pool2d(
+            F.avg_pool2d(bg_pad, kernel_size=(1, k), stride=1, padding=0),
+            kernel_size=(k, 1),
+            stride=1,
+            padding=0,
+        )
+        norm = torch.clamp(x_raw / (bg_smooth + 1e-4), 0.0, 1.0)
+        return norm
 
     def _load_from_state_dict(
         self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
     ):
-        """Allow seamless loading of legacy 1-channel enc1.0.weight checkpoints if needed."""
+        """Allow seamless loading of legacy v4 checkpoints if encountered."""
         w_key = prefix + "enc1.0.weight"
         if w_key in state_dict:
             w_val = state_dict[w_key]
             expected_shape = self.enc1[0].weight.shape
-            if w_val.ndim == 4 and w_val.shape[1] == 1 and expected_shape[1] == 2:
-                zeros = torch.zeros_like(w_val)
+            if w_val.ndim == 4 and w_val.shape[1] in (1, 2) and expected_shape[1] == 3:
+                channels_needed = 3 - w_val.shape[1]
+                zeros = torch.zeros(w_val.shape[0], channels_needed, w_val.shape[2], w_val.shape[3], device=w_val.device, dtype=w_val.dtype)
                 state_dict[w_key] = torch.cat([w_val, zeros], dim=1)
+
         super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+            state_dict, prefix, local_metadata, False, missing_keys, unexpected_keys, error_msgs
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Local Illumination Normalization (tương phản cục bộ giúp lộ rõ chữ trong bóng râm ShadowCast)
-        bg = F.avg_pool2d(x, kernel_size=31, stride=1, padding=15)
-        x_norm = torch.clamp(x / (bg + 1e-4), 0.0, 1.0)
-        x_in = torch.cat([x, x_norm], dim=1)  # [B, 2, H, W]
+        # Ensure FP32 safe logit input (matches Colab training: float32 + [0.002, 0.998] range protection)
+        x_safe = torch.nan_to_num(x.float(), nan=1.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0) * 0.996 + 0.002
+
+        # Pre-filtering with 3x3 median filter
+        x_med = self._median_filter_3x3(x_safe)
+
+        # 2 scales: k=31 and k=101
+        x_norm_31 = self._get_norm_robust(x_med, x_safe, 31)
+        x_norm_101 = self._get_norm_robust(x_med, x_safe, 101)
+
+        x_in = torch.cat([x_safe, x_norm_31, x_norm_101], dim=1)  # [B, 3, H, W]
 
         # Encoder
-        e1 = self.enc1(x_in)     # [B, 64, H, W]
-        d1 = self.down1(e1)      # [B, 128, H/2, W/2]
+        e1 = self.enc1(x_in)    # [B, 64, H, W]
+        d1 = self.down1(e1)     # [B, 128, H/2, W/2]
 
-        e2 = self.enc2(d1)       # [B, 128, H/2, W/2]
-        d2 = self.down2(e2)      # [B, 256, H/4, W/4]
+        e2 = self.enc2(d1)      # [B, 128, H/2, W/2]
+        d2 = self.down2(e2)     # [B, 256, H/4, W/4]
 
-        e3 = self.enc3(d2)       # [B, 256, H/4, W/4]
-        d3 = self.down3(e3)      # [B, 512, H/8, W/8]
+        e3 = self.enc3(d2)      # [B, 256, H/4, W/4]
+        d3 = self.down3(e3)     # [B, 512, H/8, W/8]
 
-        # Bottleneck
-        b = self.bottleneck(d3)  # [B, 512, H/8, W/8]
+        # Bottleneck (ResBlock + ASPP)
+        b = self.bottleneck(d3) # [B, 512, H/8, W/8]
 
-        # Decoder level 3
-        u3 = self.up3(b)                 # [B, 256, H/4, W/4]
-        c3 = torch.cat([u3, e3], dim=1)  # [B, 512, H/4, W/4]
-        d_out3 = self.dec3(c3)           # [B, 256, H/4, W/4]
+        # Decoder level 3 (Attention Gate on e3)
+        u3 = self.up3(b)
+        e3_att = self.att3(g=u3, x=e3)
+        c3 = torch.cat([u3, e3_att], dim=1)
+        d_out3 = self.dec3(c3)
 
-        # Decoder level 2
-        u2 = self.up2(d_out3)            # [B, 128, H/2, W/2]
-        c2 = torch.cat([u2, e2], dim=1)  # [B, 256, H/2, W/2]
-        d_out2 = self.dec2(c2)           # [B, 128, H/2, W/2]
+        # Decoder level 2 (Attention Gate on e2)
+        u2 = self.up2(d_out3)
+        e2_att = self.att2(g=u2, x=e2)
+        c2 = torch.cat([u2, e2_att], dim=1)
+        d_out2 = self.dec2(c2)
 
-        # Decoder level 1
-        u1 = self.up1(d_out2)            # [B, 64, H, W]
-        c1 = torch.cat([u1, e1], dim=1)  # [B, 128, H, W]
-        out = self.dec1(c1)              # [B, out_channels, H, W]
+        # Decoder level 1 (Direct skip on e1)
+        u1 = self.up1(d_out2)
+        c1 = torch.cat([u1, e1], dim=1)
+        d_out1 = self.dec1(c1)
 
-        return out
+        # Logit-space residual head (FP32 safe logit)
+        delta = self.out_conv(d_out1).float()
+        base_clamped = torch.clamp(x_norm_31.float(), 1e-4, 1.0 - 1e-4)
+        base_logit = torch.logit(base_clamped)
+        y_pred = torch.sigmoid(base_logit + delta)
+        return torch.nan_to_num(y_pred.float(), nan=1.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
+
+# ==============================================================================
+# EVALUATION METRICS
+# ==============================================================================
 
 def calculate_psnr(img1: torch.Tensor, img2: torch.Tensor) -> float:
     """Calculate PSNR between two tensors with values in [0, 1]."""
     mse = torch.mean((img1 - img2) ** 2).item()
     if mse == 0:
         return 100.0
-    return 20 * math.log10(1.0 / math.sqrt(mse))
+    return 20.0 * math.log10(1.0 / math.sqrt(mse))
 
+
+# ==============================================================================
+# TRAINING PIPELINE
+# ==============================================================================
 
 def train_restoration_model(
     train_csv: str = "datasets/metadata/train.csv",
     val_csv: str = "datasets/metadata/val.csv",
     output_dir: str = "models",
-    epochs: int = 20,
+    epochs: int = 40,
     batch_size: int = 4,
-    lr: float = 1e-4,
+    lr: float = 2e-4,
     image_size: int = 512,
-    manifest: str = None,
-    dataset_root: str = None,
-    resume_weights: str = "models/restoration_best.pth",
+    manifest: Optional[str] = None,
+    dataset_root: Optional[str] = None,
+    resume_weights: Optional[str] = None,
 ):
-    """Train or Fine-Tune Document Restoration UNet with validation and best checkpoint saving.
-
-    If `manifest` is given (datasets/metadata/dataset_manifest.csv), train/val pairs are read from it
-    (many inputs -> one target) and `train_csv`/`val_csv` are ignored.
-    If `resume_weights` exists on disk, warm-starts the U-Net from those pretrained weights.
+    """
+    Train or Fine-Tune Document Restoration UNet v5 with validation and best checkpoint saving.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Starting Document Restoration Training on device: {device}")
+    logger.info(f"Starting Document Restoration UNet v5 Training on device: {device}")
 
-    # Create datasets
     img_size = (image_size, image_size)
     if manifest:
         train_csv = val_csv = manifest
@@ -360,40 +560,32 @@ def train_restoration_model(
         train_dataset = DocumentRestorationDataset(metadata_csv=train_csv, image_size=img_size, split="train", is_train=True)
         val_dataset = DocumentRestorationDataset(metadata_csv=val_csv, image_size=img_size, split="val", is_train=False)
 
-        # Automatic fallback to manifest if default train_csv has no valid image pairs on disk
-        if ("datasets" in train_csv and "train.csv" in train_csv) and len(train_dataset) == 0:
-            manifest_fallback = "datasets/metadata/dataset_manifest.csv"
-            if os.path.exists(manifest_fallback):
-                logger.info(f"No valid image pairs in '{train_csv}', falling back to manifest: {manifest_fallback}")
-                train_dataset = DocumentRestorationDataset(manifest_fallback, image_size=img_size, split="train", is_train=True, root_dir=dataset_root)
-                val_dataset = DocumentRestorationDataset(manifest_fallback, image_size=img_size, split="val", is_train=False, root_dir=dataset_root)
-
     if len(train_dataset) == 0:
         logger.error(f"No training pairs found in '{train_csv}'. Training aborted.")
         raise ValueError(f"No training pairs found in '{train_csv}'. Training aborted.")
-    if len(val_dataset) == 0:
-        logger.warning(f"No validation pairs found in '{val_csv}'. Will train without validation.")
 
     logger.info(f"Train samples: {len(train_dataset)} | Val samples: {len(val_dataset)}")
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0) if len(val_dataset) > 0 else []
 
     # Model
     model = DocumentRestorationUNet().to(device)
     total_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Model parameters: {total_params:,}")
+    logger.info(f"U-Net v5 Model parameters: {total_params:,}")
 
     if resume_weights and os.path.exists(resume_weights):
-        state_dict = torch.load(resume_weights, map_location=device, weights_only=True)
-        model.load_state_dict(state_dict)
-        logger.info(f"Warm-Start (Fine-Tune): Loaded pretrained weights from '{resume_weights}'")
+        try:
+            state_dict = torch.load(resume_weights, map_location=device, weights_only=True)
+            model.load_state_dict(state_dict)
+            logger.info(f"Loaded pretrained weights from '{resume_weights}'")
+        except Exception as e:
+            logger.warning(f"Could not load checkpoint '{resume_weights}' directly ({e}). Initializing fresh v5 weights.")
 
-    # Loss and optimizer: Multi-purpose DocumentCleanLoss (Weighted Charbonnier + BCE + Sobel + SSIM + Bimodal + BleedThroughSuppression)
     criterion = DocumentCleanLoss().to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
-    # Checkpoint directory
     os.makedirs(output_dir, exist_ok=True)
     best_model_path = os.path.join(output_dir, "restoration_best.pth")
     last_model_path = os.path.join(output_dir, "restoration_last.pth")
@@ -402,7 +594,7 @@ def train_restoration_model(
     training_log = []
 
     for epoch in range(1, epochs + 1):
-        # ======================== TRAIN ========================
+        # TRAIN
         model.train()
         train_loss = 0.0
         train_psnr = 0.0
@@ -422,10 +614,11 @@ def train_restoration_model(
                 train_psnr += calculate_psnr(pred, clean)
             train_steps += 1
 
+        scheduler.step()
         avg_train_loss = train_loss / max(train_steps, 1)
         avg_train_psnr = train_psnr / max(train_steps, 1)
 
-        # ======================== VALIDATION ========================
+        # VALIDATION
         avg_val_loss = 0.0
         avg_val_psnr = 0.0
 
@@ -447,37 +640,34 @@ def train_restoration_model(
             avg_val_loss = val_loss / max(val_steps, 1)
             avg_val_psnr = val_psnr / max(val_steps, 1)
 
-        # Log
         epoch_info = {
             "epoch": epoch,
             "train_loss": round(avg_train_loss, 6),
             "train_psnr": round(avg_train_psnr, 2),
             "val_loss": round(avg_val_loss, 6),
             "val_psnr": round(avg_val_psnr, 2),
+            "lr": round(scheduler.get_last_lr()[0], 7),
         }
         training_log.append(epoch_info)
 
         logger.info(
             f"Epoch [{epoch}/{epochs}] "
             f"Train Loss: {avg_train_loss:.4f} | Train PSNR: {avg_train_psnr:.2f} dB | "
-            f"Val Loss: {avg_val_loss:.4f} | Val PSNR: {avg_val_psnr:.2f} dB"
+            f"Val Loss: {avg_val_loss:.4f} | Val PSNR: {avg_val_psnr:.2f} dB | "
+            f"LR: {scheduler.get_last_lr()[0]:.2e}"
         )
 
-        # Save last checkpoint
         torch.save(model.state_dict(), last_model_path)
 
-        # Save best checkpoint based on validation PSNR
         if avg_val_psnr > best_val_psnr and len(val_dataset) > 0:
             best_val_psnr = avg_val_psnr
             torch.save(model.state_dict(), best_model_path)
             logger.info(f"  -> New best model saved (Val PSNR: {best_val_psnr:.2f} dB)")
 
-    # If no validation data, save last as best
     if len(val_dataset) == 0:
         torch.save(model.state_dict(), best_model_path)
         logger.info("No validation data. Saved last model as best.")
 
-    # Save training log
     log_path = os.path.join(output_dir, "training_log.json")
     val_psnr_record = round(best_val_psnr, 2) if best_val_psnr != -float("inf") else None
     with open(log_path, "w", encoding="utf-8") as f:
@@ -494,48 +684,35 @@ def train_restoration_model(
         }, f, indent=2)
 
     logger.info(f"Training complete. Best Val PSNR: {val_psnr_record if val_psnr_record is not None else 'N/A'} dB")
-    logger.info(f"Best model: {best_model_path}")
-    logger.info(f"Last model: {last_model_path}")
-    logger.info(f"Training log: {log_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train Document Image Restoration UNet v5")
+    parser.add_argument("--train-csv", default="datasets/metadata/train.csv")
+    parser.add_argument("--val-csv", default="datasets/metadata/val.csv")
+    parser.add_argument("--output-dir", default="models")
+    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--image-size", type=int, default=512)
+    parser.add_argument("--manifest", default=None)
+    parser.add_argument("--dataset-root", default=None)
+    parser.add_argument("--resume-weights", default=None)
+    args = parser.parse_args()
+
+    train_restoration_model(
+        train_csv=args.train_csv,
+        val_csv=args.val_csv,
+        output_dir=args.output_dir,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        image_size=args.image_size,
+        manifest=args.manifest,
+        dataset_root=args.dataset_root,
+        resume_weights=args.resume_weights,
+    )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Document Image Restoration UNet")
-    parser.add_argument("--train-csv", default="datasets/metadata/train.csv",
-                        help="Path to training metadata CSV")
-    parser.add_argument("--val-csv", default="datasets/metadata/val.csv",
-                        help="Path to validation metadata CSV")
-    parser.add_argument("--output-dir", default="models",
-                        help="Directory to save model checkpoints")
-    parser.add_argument("--epochs", type=int, default=20,
-                        help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=4,
-                        help="Batch size for training")
-    parser.add_argument("--lr", type=float, default=1e-4,
-                        help="Learning rate")
-    parser.add_argument("--image-size", type=int, default=512,
-                        help="Target image size (square)")
-    parser.add_argument("--manifest", default=None,
-                        help="dataset_manifest.csv (many inputs -> one target); overrides --train-csv/--val-csv")
-    parser.add_argument("--dataset-root", default=None,
-                        help="Root that manifest paths are relative to (default: datasets/)")
-    parser.add_argument("--resume-weights", default="models/restoration_best.pth",
-                        help="Path to pretrained weights for warm-start fine-tuning")
-    args = parser.parse_args()
-
-    try:
-        train_restoration_model(
-            train_csv=args.train_csv,
-            val_csv=args.val_csv,
-            output_dir=args.output_dir,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            lr=args.lr,
-            image_size=args.image_size,
-            manifest=args.manifest,
-            dataset_root=args.dataset_root,
-            resume_weights=args.resume_weights,
-        )
-    except Exception as e:
-        logger.error(f"Training failed: {e}")
-        sys.exit(1)
+    main()

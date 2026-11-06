@@ -358,10 +358,11 @@ def infer_single_image_tiled(
             img_pad = cv2.copyMakeBorder(img_gray, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
         else:
             img_pad = img_gray
-        tensor_in = torch.from_numpy(img_pad).unsqueeze(0).unsqueeze(0).float().to(device) / 255.0
+        tensor_in = (torch.from_numpy(img_pad).unsqueeze(0).unsqueeze(0).float().to(device) / 255.0).clamp(0.0, 1.0)
         with torch.no_grad():
-            pred = model(tensor_in)
-        out = (torch.clamp(pred, 0.0, 1.0).squeeze().cpu().numpy() * 255.0).astype(np.uint8)
+            pred = model(tensor_in.float())
+            pred = torch.nan_to_num(pred.float(), nan=1.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        out = (pred.squeeze().cpu().numpy() * 255.0).astype(np.uint8)
         return out[:h_orig, :w_orig]
 
     # Pad any dimension smaller than tile_size
@@ -394,14 +395,39 @@ def infer_single_image_tiled(
         for y in y_starts:
             for x in x_starts:
                 tile = img_pad[y:y + tile_size, x:x + tile_size]
-                tile_t = torch.from_numpy(tile).unsqueeze(0).unsqueeze(0).float().to(device) / 255.0
-                pred_t = model(tile_t)
-                pred_np = torch.clamp(pred_t, 0.0, 1.0).squeeze().cpu().numpy()
+                tile_t = (torch.from_numpy(tile).unsqueeze(0).unsqueeze(0).float().to(device) / 255.0).clamp(0.0, 1.0)
+                pred_t = model(tile_t.float())
+                pred_np = torch.nan_to_num(pred_t.float(), nan=1.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0).squeeze().cpu().numpy()
                 acc_pred[y:y + tile_size, x:x + tile_size] += pred_np * weight_2d
                 acc_weight[y:y + tile_size, x:x + tile_size] += weight_2d
 
     merged = acc_pred / np.maximum(acc_weight, 1e-6)
     return (np.clip(merged[:h_orig, :w_orig], 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+
+def _resolve_csv_path(raw_p: str, metadata_csv: str, root_dir: Optional[str] = None) -> str:
+    if not raw_p:
+        return ""
+    if os.path.isabs(raw_p) and os.path.exists(raw_p):
+        return os.path.normpath(raw_p)
+    if os.path.exists(raw_p):
+        return os.path.normpath(os.path.abspath(raw_p))
+    if root_dir:
+        cand = os.path.normpath(os.path.join(root_dir, raw_p))
+        if os.path.exists(cand):
+            return cand
+    if metadata_csv:
+        csv_dir = os.path.dirname(os.path.abspath(metadata_csv))
+        for p in (csv_dir, os.path.dirname(csv_dir), os.path.dirname(os.path.dirname(csv_dir))):
+            cand = os.path.normpath(os.path.join(p, raw_p))
+            if os.path.exists(cand):
+                return cand
+            if raw_p.startswith(("datasets/", "datasets\\")):
+                cand2 = os.path.normpath(os.path.join(p, raw_p[9:]))
+                if os.path.exists(cand2):
+                    return cand2
+    return os.path.normpath(raw_p)
 
 
 class DocumentRestorationDataset(Dataset):
@@ -516,8 +542,8 @@ class DocumentRestorationDataset(Dataset):
                     self.total_rows += 1
                     raw_in = (row.get("input") or "").strip()
                     raw_tgt = (row.get("target") or "").strip()
-                    input_path = os.path.normpath(raw_in) if raw_in else ""
-                    target_path = os.path.normpath(raw_tgt) if raw_tgt else ""
+                    input_path = _resolve_csv_path(raw_in, metadata_csv, root_dir)
+                    target_path = _resolve_csv_path(raw_tgt, metadata_csv, root_dir)
                     deg_str = (row.get("degradation") or row.get("blur_level") or "").strip()
                     src_id = (row.get("source_id") or row.get("original_id") or "").strip()
                     active_split = (row.get("split") or effective_split).strip().lower()
@@ -576,6 +602,12 @@ class DocumentRestorationDataset(Dataset):
                     or deg_str.lower() in ("real_pairs", "realcamera")
                 )
 
+                is_clean_gt = (
+                    str(row.get("is_clean_gt", "")).lower() in ("true", "1")
+                    or "clean_originals" in target_path.lower()
+                    or "destroyer_pairs" in target_path.lower()
+                )
+
                 if is_manifest:
                     self.pairs.append({
                         "input": input_path,
@@ -586,6 +618,7 @@ class DocumentRestorationDataset(Dataset):
                         "variant_id": row.get("variant_id", ""),
                         "split": row.get("split", ""),
                         "is_real_pair": is_real_pair,
+                        "is_clean_gt": is_clean_gt,
                         "is_unpaired": False,
                     })
                 else:
@@ -595,6 +628,7 @@ class DocumentRestorationDataset(Dataset):
                         "source_id": src_id,
                         "degradation": deg_str,
                         "is_real_pair": is_real_pair,
+                        "is_clean_gt": is_clean_gt,
                         "is_unpaired": False,
                     })
 
@@ -628,7 +662,12 @@ class DocumentRestorationDataset(Dataset):
         if clean_bgr is None:
             raise FileNotFoundError(f"Failed to load clean target image: {path}")
         clean_gray = cv2.cvtColor(clean_bgr, cv2.COLOR_BGR2GRAY)
-        is_real_target = skip_normalization or ("real_pairs" in path.replace("\\", "/").lower())
+        is_clean_gt_path = (
+            "clean_originals" in path.replace("\\", "/").lower()
+            or "destroyer_pairs" in path.replace("\\", "/").lower()
+            or "real_pairs" in path.replace("\\", "/").lower()
+        )
+        is_real_target = skip_normalization or is_clean_gt_path
         if not is_real_target:
             clean_gray = clean_target_normalization(clean_gray)
         if len(self._target_cache) < self.target_cache_size:
@@ -656,7 +695,8 @@ class DocumentRestorationDataset(Dataset):
                 return deg_tensor, None, pair
             return deg_tensor, deg_tensor
 
-        clean_gray = self._load_target(pair["target"], skip_normalization=is_real_pair)
+        is_clean_gt = bool(pair.get("is_clean_gt", False))
+        clean_gray = self._load_target(pair["target"], skip_normalization=is_real_pair or is_clean_gt)
 
         # Align dimensions if input and clean target differ in resolution (e.g. LongestMaxSize)
         # Always resize degraded input to match clean target resolution

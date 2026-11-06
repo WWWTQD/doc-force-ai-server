@@ -114,14 +114,13 @@ class RestorationService:
             from training.train_restoration import DocumentRestorationUNet
 
             model = DocumentRestorationUNet(in_channels=1, out_channels=1).to(self._device)
-            checkpoint = torch.load(resolved_path, map_location=self._device)
+            checkpoint = torch.load(resolved_path, map_location=self._device, weights_only=True)
 
-            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-                model.load_state_dict(checkpoint["model_state_dict"])
-            elif isinstance(checkpoint, dict):
-                model.load_state_dict(checkpoint)
-            else:
-                model.load_state_dict(checkpoint)
+            state_dict = checkpoint["model_state_dict"] if (isinstance(checkpoint, dict) and "model_state_dict" in checkpoint) else checkpoint
+            try:
+                model.load_state_dict(state_dict, strict=True)
+            except Exception:
+                model.load_state_dict(state_dict, strict=False)
 
             model.eval()
             self._model = model
@@ -151,7 +150,6 @@ class RestorationService:
         """
         Runs tiled inference through DocumentRestorationUNet on an image (BGR uint8).
         Falls back to returning original img_bgr if model is not loaded or on error.
-        Optimized for CPU: max_side=1280 caps tile count (4-6 tiles) to finish in < 8s.
         """
         if not settings.ENABLE_IMAGE_RESTORATION:
             return img_bgr
@@ -179,7 +177,7 @@ class RestorationService:
             orig_h, orig_w = gray.shape[:2]
             t0 = time.perf_counter()
 
-            # Giữ độ phân giải chuẩn cho VietOCR và tối ưu tốc độ CPU (< 8s):
+            # Giữ độ phân giải chuẩn cho VietOCR và tối ưu tốc độ CPU:
             # Nếu max(orig_h, orig_w) > 1280, resize working copy về max_side = 1280 (chỉ mất 4-6 tiles thay vì 25+ tiles)
             max_side = max(orig_h, orig_w)
             if max_side > 1280:
@@ -190,7 +188,7 @@ class RestorationService:
             else:
                 gray_work = gray
 
-            # Chạy thuần túy U-Net (Pure DocumentRestorationUNet) không gọi lại torch.set_num_threads để tránh xung đột
+            # Chạy thuần túy U-Net v5 (Pure DocumentRestorationUNet) ở chuẩn FP32 Safe Logit
             with torch.no_grad():
                 y_work = infer_single_image_tiled(
                     self._model,
