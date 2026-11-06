@@ -27,6 +27,7 @@ import cv2
 import numpy as np
 
 LOG = logging.getLogger("ocr_engine")
+LOG.setLevel(logging.INFO)
 
 YOLO_AVAILABLE = False
 try:
@@ -100,12 +101,14 @@ def _resolve_layout_model_path() -> str:
     env_path = os.environ.get("LAYOUT_MODEL_PATH")
     if env_path:
         return env_path
-    models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-    for name in ("layout_best_backup.pt", "best.pt"):
-        candidate = os.path.join(models_dir, name)
-        if os.path.exists(candidate):
-            return candidate
-    return os.path.join(models_dir, "layout_best_backup.pt")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    for folder in ("models", "Model"):
+        models_dir = os.path.join(base_dir, folder)
+        for name in ("layout_best_backup.pt", "best.pt"):
+            candidate = os.path.join(models_dir, name)
+            if os.path.exists(candidate):
+                return candidate
+    return os.path.join(base_dir, "models", "layout_best_backup.pt")
 
 
 class OCREngine:
@@ -115,6 +118,21 @@ class OCREngine:
         self.lang = lang
         self.ocr_instance = None
         self.yolo_model = None
+        root_log = logging.getLogger()
+        saved_handlers = list(root_log.handlers)
+        root_log.setLevel(logging.INFO)
+        LOG.setLevel(logging.INFO)
+
+        def _restore_handlers():
+            root_log.setLevel(logging.INFO)
+            LOG.setLevel(logging.INFO)
+            if saved_handlers:
+                for h in list(root_log.handlers):
+                    if h not in saved_handlers:
+                        root_log.removeHandler(h)
+                for h in saved_handlers:
+                    if h not in root_log.handlers:
+                        root_log.addHandler(h)
 
         if YOLO_AVAILABLE:
             try:
@@ -124,10 +142,12 @@ class OCREngine:
                 if os.path.exists(model_path):
                     LOG.info("Khởi tạo YOLO layout detection (%s)...", model_path)
                     self.yolo_model = YOLO(model_path)
+                    _restore_handlers()
                     LOG.info("YOLO model khởi tạo thành công.")
                 else:
                     LOG.warning("Không tìm thấy model YOLO tại %s. Bỏ qua layout detection.", model_path)
             except Exception as e:
+                _restore_handlers()
                 LOG.error("Lỗi khi khởi tạo YOLO model: %s. Bỏ qua layout detection.", e)
 
         if PADDLE_AVAILABLE:
@@ -143,8 +163,10 @@ class OCREngine:
                     det_db_box_thresh=0.18,
                     det_db_unclip_ratio=1.35,
                 )
+                _restore_handlers()
                 LOG.info("PaddleOCR khởi tạo thành công.")
             except Exception as e:
+                _restore_handlers()
                 LOG.error("Lỗi khi khởi tạo PaddleOCR: %s. Chuyển sang Fallback Engine.", e)
 
         self.viet_recognizer = None

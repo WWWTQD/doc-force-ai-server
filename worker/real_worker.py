@@ -42,6 +42,15 @@ if PROJECT_ROOT not in sys.path:
 if WORKER_DIR not in sys.path:
     sys.path.insert(0, WORKER_DIR)
 
+# Cấu hình UTF-8 cho stdout/stderr trên Windows để tránh lỗi UnicodeEncodeError khi ghi log
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 # Cấu hình logging chuẩn ra stdout
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
@@ -84,12 +93,29 @@ except ImportError:
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
+def _configure_worker_logging(clear_file: bool = False):
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+    try:
+        log_file = os.path.join(PROJECT_ROOT, "worker_live.log")
+        fh = logging.FileHandler(log_file, mode="w" if clear_file else "a", encoding="utf-8")
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+    except Exception:
+        pass
+
+
+_configure_worker_logging(clear_file=True)
 LOG = logging.getLogger("real_worker")
+LOG.setLevel(logging.INFO)
 
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8080").rstrip("/")
 WORKER_SECRET_KEY = os.environ.get("WORKER_SECRET_KEY", "worker-secret-local")
@@ -577,14 +603,18 @@ def main():
     print(f"Worker ID    : {WORKER_INSTANCE_ID}", flush=True)
     print(f"Poll interval: {POLL_INTERVAL:.0f}s\n", flush=True)
 
-    # Khởi tạo DocumentRestorationUNet
+    # Đảm bảo logging ra console và worker_live.log không bị Ultralytics hay PaddleOCR đè level
+    _configure_worker_logging(clear_file=True)
+    LOG.info("Backend URL: %s | Worker ID: %s | Poll interval: %.0fs", BACKEND_URL, WORKER_INSTANCE_ID, POLL_INTERVAL)
+
+    # Khởi tạo DocumentRestorationUNet v5
     restoration_service = None
     if ENABLE_IMAGE_RESTORATION:
         try:
             from app.services.restoration_service import RestorationService
             restoration_service = RestorationService.get_instance()
             if restoration_service.is_available:
-                LOG.info("✓ DocumentRestorationUNet đã sẵn sàng!")
+                LOG.info("✓ DocumentRestorationUNet v5 đã sẵn sàng!")
             else:
                 LOG.warning("DocumentRestorationUNet chưa có trọng số khả dụng.")
         except Exception as exc:
@@ -600,10 +630,9 @@ def main():
         enable_restoration=ENABLE_IMAGE_RESTORATION,
     )
 
-    # Đảm bảo logging ra console không bị Ultralytics hay PaddleOCR đè level
-    logging.getLogger().setLevel(logging.INFO)
-    LOG.setLevel(logging.INFO)
-
+    # Đảm bảo logging ra console và worker_live.log không bị Ultralytics hay PaddleOCR đè level
+    _configure_worker_logging(clear_file=False)
+    LOG.info("✓ AI Worker đã sẵn sàng! Đang lắng nghe tác vụ OCR từ Web...")
     print("✓ AI Worker đã sẵn sàng! Đang lắng nghe tác vụ OCR từ Web...", flush=True)
 
     consecutive_errors = 0
