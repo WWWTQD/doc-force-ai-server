@@ -189,7 +189,17 @@ class DocumentScanner:
         self.orientation_scorer = orientation_scorer
         self.model = None
 
-        path = model_path or os.environ.get("DOCUMENT_MODEL_PATH") or DEFAULT_MODEL_PATH
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(base_dir)
+        path = model_path or os.environ.get("DOCUMENT_MODEL_PATH")
+        if not path or not os.path.exists(path):
+            for root in (base_dir, project_root, "/app"):
+                cand = os.path.join(root, "models", "document_detector.pt")
+                if os.path.exists(cand):
+                    path = cand
+                    break
+            else:
+                path = DEFAULT_MODEL_PATH
         if YOLO_AVAILABLE and os.path.exists(path):
             try:
                 self.model = YOLO(path)
@@ -277,10 +287,10 @@ class DocumentScanner:
         """Trả về góc cần xoay theo chiều kim đồng hồ (0/90/180/270)."""
         h, w = img.shape[:2]
         if text_axis_is_vertical(img):
-            candidates = [90, 270]
+            candidates = [270, 90]
         elif w > h * 1.1:
-            # Ảnh nằm ngang (landscape) như tài liệu chụp ngang điện thoại: ưu tiên kiểm tra 90°, 270° và 0°
-            candidates = [90, 270, 0]
+            # Ảnh nằm ngang (landscape) từ cam scan / điện thoại: 270° là chiều thuận phổ biến nhất
+            candidates = [270, 90, 0]
         else:
             candidates = [0, 180]
 
@@ -290,15 +300,18 @@ class DocumentScanner:
         try:
             best_rot = candidates[0]
             best_score = self.orientation_scorer(rotate_image(img, best_rot))
-            if best_score >= 0.85:  # đọc rất tốt ở hướng đầu tiên -> khỏi thử hướng ngược
+            if best_score >= 0.75:  # Đọc ra chữ tiếng Việt rõ ràng ở hướng đầu tiên -> dừng ngay (< 0.4s)
+                LOG.info("Orientation score fast-hit: {%d: %.3f} -> chọn %d°", best_rot, best_score, best_rot)
                 return best_rot
             scores = {best_rot: best_score}
             for cand in candidates[1:]:
                 sc = self.orientation_scorer(rotate_image(img, cand))
                 scores[cand] = sc
-                if sc > best_score + 0.05:
+                if sc > best_score:
                     best_score = sc
                     best_rot = cand
+                if best_score >= 0.75:
+                    break
             LOG.info("Orientation score: %s -> chọn %d°", scores, best_rot)
             return best_rot
         except Exception as exc:

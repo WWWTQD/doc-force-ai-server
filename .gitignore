@@ -48,6 +48,8 @@ uploads/
 outputs/
 data/input/
 data/output/
+real/
+latest_doc/
 
 # Firmware (may contain WiFi credentials/device keys)
 firmware/

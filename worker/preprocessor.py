@@ -96,8 +96,8 @@ class ImagePreprocessor:
         return self.deskew_with_matrix(img)[0]
 
     def denoise(self, img: np.ndarray) -> np.ndarray:
-        """Khử nhiễu giữ cạnh sắc nét bằng Bilateral Filter."""
-        return cv2.bilateralFilter(img, d=9, sigmaColor=75, sigmaSpace=75)
+        """Khử nhiễu giữ cạnh sắc nét bằng Bilateral Filter tối ưu tốc độ (d=5)."""
+        return cv2.bilateralFilter(img, d=5, sigmaColor=50, sigmaSpace=50)
 
     def enhance_clahe(self, img: np.ndarray) -> np.ndarray:
         """Tăng cường tương phản vùng bằng CLAHE trên kênh L (LAB)."""
