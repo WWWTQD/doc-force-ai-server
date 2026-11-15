@@ -84,38 +84,24 @@ class ScanPipeline:
     def process_image(self, img: np.ndarray, page_number: int) -> PageScanResult:
         h, w = img.shape[:2]
         if self.enable_document_scan:
-            # Bước 1: Kiểm tra xem có YOLO document_detector rõ ràng không (conf >= 0.35).
-            # Nếu không có model hoặc fallback opencv cắt lẹm trang (< 80%), giữ nguyên 100% khung trang gốc
-            # để bảo toàn đầu/đuôi trang; sau đó BẮT BUỘC tự động xoay hướng 0°/90°/180°/270° về chiều đứng!
-            try:
-                corners, method, conf = self.scanner.detect_corners(img)
-            except Exception as exc:
-                LOG.warning("Document detection lỗi: %s — giữ nguyên khung ảnh.", exc)
-                corners, method, conf = None, "none", 0.0
-
-            use_warp = False
+            # Giữ nguyên 100% khung ảnh gốc (không cắt lẹm lề/đầu/cuối trang và bỏ qua YOLO detect_corners chậm trên CPU)
+            # Chỉ thực hiện xoay tự động 0°/90°/180°/270° về đúng chiều đọc tiếng Việt (< 0.4s)
             warped_img = img
             warp_transform = np.eye(3, dtype=np.float64)
+            method = "original"
+            conf = 1.0
             corners_list = None
-
-            if corners is not None and method not in ("none", "opencv") and conf >= 0.35:
-                cand_img, cand_transform = self.scanner.warp(img, corners)
-                ch, cw = cand_img.shape[:2]
-                if (ch * cw) >= (h * w * 0.75) and ch >= min(h, w) * 0.80 and cw >= min(h, w) * 0.80:
-                    use_warp = True
-                    warped_img = cand_img
-                    warp_transform = cand_transform
-                    corners_list = corners.tolist()
-
-            if not use_warp:
-                method = "original"
-                conf = 0.0
 
             rotation = self.scanner.orient(warped_img)
             if rotation:
                 rh, rw = warped_img.shape[:2]
                 warp_transform = rotation_matrix(rotation, rw, rh) @ warp_transform
                 warped_img = rotate_image(warped_img, rotation)
+
+            try:
+                warped_img = self.preprocessor.clean_handwriting_and_book_gutter(warped_img)
+            except Exception as exc:
+                LOG.warning("Lỗi khi lọc chữ viết tay / gáy sách: %s", exc)
 
             LOG.info(
                 "  [ScanPipeline] method=%s conf=%.2f rotation=%d° (%dx%d -> %dx%d)",

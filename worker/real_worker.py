@@ -770,12 +770,18 @@ def _generate_docx_from_snapshot(snapshot: dict) -> bytes:
 
             if "heading" in b_type or b_type == "title":
                 p = doc.add_paragraph()
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                h_align = str(style_meta.get("textAlign", "center")).lower()
+                if h_align == "left":
+                    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                elif h_align == "right":
+                    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                else:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 p.paragraph_format.space_before = Pt(8)
                 p.paragraph_format.space_after = Pt(6)
                 p.paragraph_format.line_spacing = 1.2
                 style_meta["bold"] = True
-                style_meta["fontSizePt"] = style_meta.get("fontSizePt", 14.0)
+                style_meta["fontSizePt"] = style_meta.get("fontSizePt", 14.5)
                 _append_formatted_runs(p, text, style_meta)
             elif "table" in b_type:
                 table_data = block.get("tableData")
@@ -783,11 +789,27 @@ def _generate_docx_from_snapshot(snapshot: dict) -> bytes:
                     headers = table_data.get("headers", [])
                     rows = table_data.get("rows", [])
                     tbl = doc.add_table(rows=1 + len(rows), cols=len(headers))
+                    try:
+                        tbl.style = "Table Grid"
+                    except Exception:
+                        pass
+                    tbl_font_name = style_meta.get("fontFamily", "Times New Roman")
+                    tbl_font_pt = float(style_meta.get("fontSizePt", 12.0))
                     for c_i, h_text in enumerate(headers):
-                        tbl.rows[0].cells[c_i].text = str(h_text)
+                        cell_p = tbl.rows[0].cells[c_i].paragraphs[0]
+                        cell_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        run = cell_p.add_run(_strip_markdown_tokens(str(h_text)))
+                        run.bold = True
+                        run.font.name = tbl_font_name
+                        run.font.size = Pt(tbl_font_pt)
                     for r_i, row_cells in enumerate(rows):
                         for c_i, cell_val in enumerate(row_cells[:len(headers)]):
-                            tbl.rows[r_i + 1].cells[c_i].text = str(cell_val)
+                            cell_p = tbl.rows[r_i + 1].cells[c_i].paragraphs[0]
+                            _append_formatted_runs(
+                                cell_p,
+                                str(cell_val),
+                                {"fontFamily": tbl_font_name, "fontSizePt": tbl_font_pt, "bold": False},
+                            )
                 else:
                     p = doc.add_paragraph()
                     run = p.add_run(f"[BẢNG]: {text}")

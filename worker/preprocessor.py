@@ -46,50 +46,87 @@ class ImagePreprocessor:
             raise ValueError("Không thể encode ảnh thành bytes")
         return encoded_img.tobytes()
 
+    def clean_handwriting_and_book_gutter(self, img: np.ndarray) -> np.ndarray:
+        """
+        1. Khử chữ viết tay bằng bút bi xanh/tím/đỏ, dấu ngoặc nháp và ghi chú lề ("chữ nháp ghi vào")
+           bằng cách so sánh độ lệch sắc độ (chromaticity) với nền giấy cục bộ, giữ nguyên chữ in đen trung tính.
+        2. Phát hiện rãnh gáy sách (book spine gutter) khi chụp trang sách mở và làm trắng phần chữ bị cắt của trang kế bên.
+        """
+        if img is None or img.ndim != 3:
+            return img
+        out = img.copy()
+        h, w = out.shape[:2]
+
+        # Bước 1: Ước lượng nền giấy cục bộ trên ảnh thu nhỏ (nhanh < 15ms)
+        scale = 0.25
+        small = cv2.resize(out, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        bg_small = cv2.medianBlur(small, 31)
+        bg_small = cv2.GaussianBlur(bg_small, (15, 15), 0)
+        bg = cv2.resize(bg_small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        b_ch = out[:, :, 0].astype(np.int16)
+        g_ch = out[:, :, 1].astype(np.int16)
+        r_ch = out[:, :, 2].astype(np.int16)
+        bg_b = bg[:, :, 0].astype(np.int16)
+        bg_g = bg[:, :, 1].astype(np.int16)
+        bg_r = bg[:, :, 2].astype(np.int16)
+
+        # Độ hấp thụ ánh sáng so với nền giấy cục bộ (chữ tối hơn nền -> giá trị dương)
+        drop_b = bg_b - b_ch
+        drop_g = bg_g - g_ch
+        drop_r = bg_r - r_ch
+
+        # Bút bi xanh / tím thực sự: kênh B cao hơn kênh R rõ rệt cả về giá trị tuyệt đối lẫn độ hấp thụ so với nền giấy
+        blue_pen = (drop_r >= 14) & ((drop_r - drop_b) >= 14) & ((b_ch - r_ch) >= 14)
+        purple_pen = (drop_g >= 15) & ((drop_g - drop_b) >= 14) & ((b_ch - g_ch) >= 13)
+        red_pen = (drop_b >= 18) & ((drop_b - drop_r) >= 18) & ((r_ch - b_ch) >= 18)
+
+        # Bảo vệ tuyệt đối mọi pixel chữ in đen/xám trung tính (kể cả vùng chữ in hơi mờ ở rìa trang)
+        neutral_print = (drop_b >= 25) & (drop_g >= 25) & (drop_r >= 25) & (np.abs(drop_r - drop_b) <= 13)
+        pen_mask = ((blue_pen | purple_pen | red_pen) & (~neutral_print)).astype(np.uint8) * 255
+
+        if int(pen_mask.sum()) > 0:
+            # Giãn nhẹ 3x3 (1px) để xóa viền nét bút bi mà không chạm vào chữ in đen
+            pen_dilated = cv2.dilate(pen_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
+            replace_mask = (pen_dilated > 0) & (~neutral_print)
+            out[replace_mask] = bg[replace_mask]
+
+        # Bước 2: Phát hiện và làm trắng phần trang sách kế bên qua rãnh gáy sách (x ∈ [6%..21%] chiều rộng)
+        gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
+        bg_gray = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
+        ink = ((bg_gray.astype(np.int16) - gray.astype(np.int16)) >= 28).astype(np.uint8)
+        y0, y1 = int(h * 0.12), int(h * 0.88)
+        band = ink[y0:y1, :]
+        col_density = band.mean(axis=0)  # tỉ lệ pixel mực trên mỗi cột X
+
+        # Tìm vùng cột chữ chính của trang (nằm trong khoảng [12% .. 92%] chiều rộng)
+        main_start_search = int(w * 0.11)
+        main_end_search = int(w * 0.40)
+        # Tìm rãnh trắng dọc (gutter valley) trong khoảng [7% .. 22%] nơi có chữ của trang bên trái (x < 9%)
+        left_edge_ink = float(col_density[int(w * 0.01):int(w * 0.09)].mean()) if w > 200 else 0.0
+        if left_edge_ink >= 0.012:
+            g_lo, g_hi = int(w * 0.08), int(w * 0.23)
+            if g_hi > g_lo + 20:
+                # Làm mượt mật độ cột với cửa sổ 25px để tìm tâm rãnh trắng gáy sách
+                win = max(15, int(w * 0.015)) | 1
+                smooth_col = np.convolve(col_density, np.ones(win) / win, mode="same")
+                gutter_x = g_lo + int(np.argmin(smooth_col[g_lo:g_hi]))
+                if smooth_col[gutter_x] <= 0.012:
+                    # Kiểm tra phía bên phải gutter_x thực sự là trang chính
+                    right_body_ink = float(col_density[gutter_x + 20:min(w, gutter_x + int(w * 0.45))].mean())
+                    if right_body_ink >= 0.025:
+                        # Xóa sạch phần chữ thừa của trang kế bên (0 .. gutter_x) bằng màu nền giấy
+                        out[:, :gutter_x] = bg[:, :gutter_x]
+                        LOG.info("  ✓ Đã lọc sạch lề trang kế bên tại gáy sách (x=0..%d)", gutter_x)
+
+        return out
+
     def deskew_with_matrix(self, img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
-        Phát hiện góc nghiêng và xoay thẳng văn bản.
-        Sử dụng Hough Lines / Minimum Bounding Rectangle.
-        Trả về (ảnh, ma trận 3x3 đã áp dụng) để truy vết toạ độ.
+        Giữ nguyên hệ trục khung trang gốc (ma trận đơn vị 3x3) vì bộ cắt dòng tứ giác _rotate_crop
+        của OCREngine đã nắn thẳng từng dòng chữ riêng biệt với độ sắc nét tối đa.
         """
-        identity = np.eye(3, dtype=np.float64)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        # Binarize bằng Otsu
-        _, thresh = cv2.threshold(
-            gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-        )
-
-        # Lấy tất cả các điểm pixel đen (chữ)
-        pts = cv2.findNonZero(thresh)
-        if pts is None or len(pts) < 10:
-            return img, identity
-
-        # Tìm góc nghiêng của minAreaRect
-        rect = cv2.minAreaRect(pts)
-        angle = rect[-1]
-
-        # Chuẩn hóa góc angle về khoảng [-45, 45]
-        if angle < -45:
-            angle = -(90 + angle)
-        elif angle > 45:
-            angle = 90 - angle
-
-        # Chỉ xoay nếu góc nghiêng đủ lớn (> 0.5 độ và < 30 độ)
-        if abs(angle) < 0.5 or abs(angle) > 30.0:
-            return img, identity
-
-        LOG.info("Phát hiện góc nghiêng %.2f độ — tiến hành xoay thẳng", angle)
-        h, w = img.shape[:2]
-        center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, angle, 1.0)
-        rotated = cv2.warpAffine(
-            img,
-            M,
-            (w, h),
-            flags=cv2.INTER_CUBIC,
-            borderMode=cv2.BORDER_REPLICATE,
-        )
-        return rotated, np.vstack([M, [0.0, 0.0, 1.0]])
+        return img, np.eye(3, dtype=np.float64)
 
     def deskew(self, img: np.ndarray) -> np.ndarray:
         """Phát hiện góc nghiêng và xoay thẳng văn bản (chỉ trả về ảnh)."""

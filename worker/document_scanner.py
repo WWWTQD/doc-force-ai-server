@@ -287,10 +287,9 @@ class DocumentScanner:
         """Trả về góc cần xoay theo chiều kim đồng hồ (0/90/180/270)."""
         h, w = img.shape[:2]
         if text_axis_is_vertical(img):
-            candidates = [270, 90]
+            candidates = [90, 270]
         elif w > h * 1.1:
-            # Ảnh nằm ngang (landscape) từ cam scan / điện thoại: 270° là chiều thuận phổ biến nhất
-            candidates = [270, 90, 0]
+            candidates = [90, 270, 0]
         else:
             candidates = [0, 180]
 
@@ -298,21 +297,16 @@ class DocumentScanner:
             return candidates[0]
 
         try:
+            scores = {}
             best_rot = candidates[0]
-            best_score = self.orientation_scorer(rotate_image(img, best_rot))
-            if best_score >= 0.75:  # Đọc ra chữ tiếng Việt rõ ràng ở hướng đầu tiên -> dừng ngay (< 0.4s)
-                LOG.info("Orientation score fast-hit: {%d: %.3f} -> chọn %d°", best_rot, best_score, best_rot)
-                return best_rot
-            scores = {best_rot: best_score}
-            for cand in candidates[1:]:
+            best_score = -1.0
+            for cand in candidates:
                 sc = self.orientation_scorer(rotate_image(img, cand))
                 scores[cand] = sc
                 if sc > best_score:
                     best_score = sc
                     best_rot = cand
-                if best_score >= 0.75:
-                    break
-            LOG.info("Orientation score: %s -> chọn %d°", scores, best_rot)
+            LOG.info("Orientation score: %s -> chọn %d°", {k: round(v, 3) for k, v in scores.items()}, best_rot)
             return best_rot
         except Exception as exc:
             LOG.warning("Orientation scorer lỗi: %s — giữ hướng %d°", exc, candidates[0])
