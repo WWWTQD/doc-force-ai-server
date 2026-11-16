@@ -30,6 +30,12 @@ except Exception:
 import cv2
 import numpy as np
 
+try:
+    from table_structure import NET_H, NET_W, TableLineNet, extract_tables, predict_line_maps
+    TABLE_NET_AVAILABLE = True
+except Exception:
+    TABLE_NET_AVAILABLE = False
+
 LOG = logging.getLogger("ocr_engine")
 LOG.setLevel(logging.INFO)
 
@@ -138,6 +144,10 @@ def _resolve_typography_model_path() -> str | None:
 
 def _resolve_orientation_model_path() -> str | None:
     return _resolve_model_path(("orientation_net.pth",))
+
+
+def _resolve_table_model_path() -> str | None:
+    return _resolve_model_path(("table_line_net.pth",))
 
 
 def _resolve_vietocr_ft_path() -> str | None:
@@ -286,6 +296,7 @@ class OCREngine:
         self.yolo_model = None
         self.typo_model = None
         self.orient_model = None
+        self.table_model = None
         self.typo_device = torch.device("cuda" if (use_gpu and torch is not None and torch.cuda.is_available()) else "cpu") if torch is not None else None
         root_log = logging.getLogger()
         saved_handlers = list(root_log.handlers)
@@ -382,6 +393,17 @@ class OCREngine:
                     LOG.warning("Không nạp được DeepDocumentTypographyResNet (%s): %s", typo_path, exc)
 
             orient_path = _resolve_orientation_model_path()
+            table_path = _resolve_table_model_path()
+            if table_path and TABLE_NET_AVAILABLE:
+                try:
+                    t_ckpt = torch.load(table_path, map_location=self.typo_device)
+                    t_model = TableLineNet().to(self.typo_device)
+                    t_model.load_state_dict(t_ckpt.get("state_dict", t_ckpt) if isinstance(t_ckpt, dict) else t_ckpt)
+                    t_model.eval()
+                    self.table_model = t_model
+                    LOG.info("TableLineNet đã nạp thành công (%s).", table_path)
+                except Exception as exc:
+                    LOG.warning("Không nạp được TableLineNet (%s): %s", table_path, exc)
             if orient_path:
                 try:
                     o_ckpt = torch.load(orient_path, map_location=self.typo_device)
@@ -394,7 +416,7 @@ class OCREngine:
                 except Exception as exc:
                     LOG.warning("Không nạp được DocumentOrientationResNet (%s): %s", orient_path, exc)
 
-    def process_image(self, img: np.ndarray, page_number: int) -> dict:
+    def process_image(self, img: np.ndarray, page_number: int, table_ref_img: np.ndarray | None = None) -> dict:
         """
         Nhận vào ảnh OpenCV (BGR) và pageNumber.
         Trả về dictionary rawLayoutJson khớp với schema LayoutValidator của Backend.
@@ -412,7 +434,7 @@ class OCREngine:
 
         if self.ocr_instance is not None:
             try:
-                return self._run_paddle_ocr(img, page_number, w, h, yolo_regions=yolo_regions)
+                return self._run_paddle_ocr(img, page_number, w, h, yolo_regions=yolo_regions, table_ref_img=table_ref_img)
             except Exception as e:
                 import traceback
                 LOG.error("Lỗi trong quá trình chạy PaddleOCR: %s. Dùng fallback engine.", e)
@@ -620,7 +642,7 @@ class OCREngine:
         Trả về list [poly, (text, confidence)] cùng định dạng PaddleOCR.
         """
         ih, iw = img.shape[:2]
-        det_scale = min(1.0, 960.0 / max(ih, iw))
+        det_scale = min(1.0, 1280.0 / max(ih, iw))
         det_img = cv2.resize(img, None, fx=det_scale, fy=det_scale, interpolation=cv2.INTER_AREA) if det_scale < 1.0 else img
         dt_boxes, _ = self.ocr_instance.text_detector(det_img)
         if dt_boxes is None or len(dt_boxes) == 0:
@@ -926,6 +948,7 @@ class OCREngine:
         width: int,
         height: int,
         yolo_regions: list[dict] | None = None,
+        table_ref_img: np.ndarray | None = None,
     ) -> dict:
         """Thực thi PaddleOCR và nhóm các dòng chữ thành khối layout trực tiếp từ ảnh quét."""
         # PaddleOCR hỗ trợ nhận ndarray trực tiếp
@@ -1173,8 +1196,8 @@ class OCREngine:
                 for idx_t, (b_prob, i_prob, s_prob, sz) in enumerate(zip(bold_probs, italic_probs, serif_probs, sizes)):
                     sw_r, slant_deg, serif_r = visual_metrics[idx_t] if idx_t < len(visual_metrics) else (median_page_sw, median_page_slant, median_page_serif)
                     rel_slant = slant_deg - median_page_slant
-                    is_bold_fused = (b_prob >= 0.78 and sw_r >= median_page_sw * 1.02) or (sw_r >= median_page_sw * 1.18) or (b_prob >= 0.65 and sw_r >= median_page_sw * 1.10)
-                    is_italic_fused = (i_prob >= 0.78 and rel_slant >= 2.0) or (rel_slant >= 6.0) or (i_prob >= 0.65 and rel_slant >= 4.0)
+                    is_bold_fused = (b_prob >= 0.85) or (b_prob >= 0.65 and sw_r >= median_page_sw * 1.03) or (sw_r >= median_page_sw * 1.18)
+                    is_italic_fused = (i_prob >= 0.85) or (i_prob >= 0.65 and rel_slant >= 2.5) or (rel_slant >= 6.0)
                     line_font = (
                         "Times New Roman"
                         if (0.55 * s_prob + 0.45 * float(doc_serif_family == "Times New Roman")) >= 0.50
@@ -1196,7 +1219,114 @@ class OCREngine:
         # ── Phát hiện & tái tạo cấu trúc Bảng biểu 2D tự động (OpenCV Grid + Cell Clustering) ──
         detected_tables = []
         consumed_box_indices = set()
-        try:
+
+        # (a) Bảng bằng mạng nơ-ron TableLineNet tự huấn luyện:
+        # Xóa đường viền bảng bằng vạch ngăn nền (white barrier) theo đúng lưới h_lines/v_lines
+        # rồi cho DBNet + VietOCR đọc từng ô độc lập — không dính cột và không tạo chữ ảo ở khoảng trống.
+        if getattr(self, "table_model", None) is not None and raw_boxes:
+            try:
+                if table_ref_img is not None and table_ref_img.shape[:2] == (height, width):
+                    tbl_src_img = table_ref_img
+                else:
+                    tbl_src_img = img
+                gray_tbl = cv2.cvtColor(tbl_src_img, cv2.COLOR_BGR2GRAY) if tbl_src_img.ndim == 3 else tbl_src_img
+                h_prob, v_prob = predict_line_maps(self.table_model, gray_tbl, self.typo_device)
+                sx_n, sy_n = NET_W / float(width), NET_H / float(height)
+                for grid in extract_tables(h_prob, v_prob):
+                    if grid.n_rows < 2 or grid.n_cols < 2 or grid.n_cols > 12:
+                        continue
+                    gx0, gy0, gx1, gy1 = grid.bbox
+                    tx0, ty0, tx1, ty1 = int(gx0 / sx_n), int(gy0 / sy_n), int(gx1 / sx_n), int(gy1 / sy_n)
+                    matched_g = []
+                    for idx_b, b_item in enumerate(raw_boxes):
+                        if idx_b in consumed_box_indices:
+                            continue
+                        bx1, by1, bx2, by2 = b_item["bbox"]
+                        bcx, bcy = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
+                        if (tx0 - 16) <= bcx <= (tx1 + 16) and (ty0 - 10) <= bcy <= (ty1 + 10):
+                            matched_g.append(idx_b)
+
+                    # Tạo ảnh vùng bảng đã tách ranh giới cột/hàng bằng màu nền giấy
+                    clean_tbl = img.copy()
+                    bg_vals = np.percentile(clean_tbl[max(0, ty0):min(height, ty1), max(0, tx0):min(width, tx1)], 88, axis=(0, 1))
+                    bg_color = tuple(int(v) for v in bg_vals) if clean_tbl.ndim == 3 else int(bg_vals)
+                    x_pad0, y_pad0 = max(0, tx0 - 12), max(0, ty0 - 12)
+                    x_pad1, y_pad1 = min(width, tx1 + 12), min(height, ty1 + 12)
+                    for a_l, b_l in grid.h_lines:
+                        p1 = (x_pad0, int(round((a_l * (x_pad0 * sx_n) + b_l) / sy_n)))
+                        p2 = (x_pad1, int(round((a_l * (x_pad1 * sx_n) + b_l) / sy_n)))
+                        cv2.line(clean_tbl, p1, p2, bg_color, thickness=14)
+                    for a_l, b_l in grid.v_lines:
+                        p1 = (int(round((a_l * (y_pad0 * sy_n) + b_l) / sx_n)), y_pad0)
+                        p2 = (int(round((a_l * (y_pad1 * sy_n) + b_l) / sx_n)), y_pad1)
+                        cv2.line(clean_tbl, p1, p2, bg_color, thickness=16)
+
+                    crop_tbl = clean_tbl[y_pad0:y_pad1, x_pad0:x_pad1]
+                    cell_dt_boxes, _ = self.ocr_instance.text_detector(crop_tbl)
+                    crops_for_rec = []
+                    coords_for_rec = []
+                    if cell_dt_boxes is not None:
+                        for c_box in cell_dt_boxes:
+                            pts = _order_poly(np.asarray(c_box, dtype=np.float32))
+                            pts[:, 0] += x_pad0
+                            pts[:, 1] += y_pad0
+                            cx, cy = float(pts[:, 0].mean()), float(pts[:, 1].mean())
+                            if not grid.contains(cx * sx_n, cy * sy_n, margin=6.0):
+                                continue
+                            r_i, c_i = grid.locate(cx * sx_n, cy * sy_n)
+                            c_img = _rotate_crop(clean_tbl, pts, pad_x=6, pad_y=None)
+                            ch_c, cw_c = c_img.shape[:2]
+                            if ch_c < 8 or cw_c < 8:
+                                continue
+                            nw_c = min(512, max(32, int(round(cw_c * (32.0 / max(1, ch_c))))))
+                            rs_c = cv2.resize(c_img, (nw_c, 32), interpolation=cv2.INTER_AREA)
+                            crops_for_rec.append(Image.fromarray(cv2.cvtColor(rs_c, cv2.COLOR_BGR2RGB)))
+                            coords_for_rec.append((r_i, c_i, float(pts[:, 1].min()), float(pts[:, 0].min())))
+
+                    cell_buf = [[[] for _ in range(grid.n_cols)] for _ in range(grid.n_rows)]
+                    if crops_for_rec and self.viet_recognizer is not None:
+                        with torch.inference_mode():
+                            rec_texts = self.viet_recognizer.predict_batch(crops_for_rec)
+                        for (r_i, c_i, y_v, x_v), txt_r in zip(coords_for_rec, rec_texts):
+                            t_clean = normalize_vietnamese_text(txt_r or "").strip()
+                            if t_clean:
+                                cell_buf[r_i][c_i].append((y_v, x_v, t_clean))
+
+                    rows_g = [
+                        [" ".join(it[2] for it in sorted(cell_buf[r_i][c_i], key=lambda k: (k[0], k[1]))).strip() for c_i in range(grid.n_cols)]
+                        for r_i in range(grid.n_rows)
+                    ]
+                    # Bù an toàn từ raw_boxes nếu ô có box DBNet nằm gọn bên trong nhưng bị sót
+                    for idx_b in matched_g:
+                        bx1, by1, bx2, by2 = raw_boxes[idx_b]["bbox"]
+                        r_i, c_i = grid.locate((bx1 + bx2) / 2.0 * sx_n, (by1 + by2) / 2.0 * sy_n)
+                        q_rc = grid.cell_quad(r_i, c_i)
+                        col_w_img = max(1.0, (q_rc[1][0] - q_rc[0][0]) / sx_n)
+                        if not rows_g[r_i][c_i] and (bx2 - bx1) <= col_w_img * 1.15:
+                            fallback_t = normalize_vietnamese_text(raw_boxes[idx_b]["text"]).strip()
+                            if fallback_t:
+                                rows_g[r_i][c_i] = fallback_t
+
+                    non_empty_cells = sum(1 for row in rows_g for val in row if val)
+                    if non_empty_cells < 3:
+                        continue
+                    for idx_b in matched_g:
+                        consumed_box_indices.add(idx_b)
+                    detected_tables.append({
+                        "type": "table",
+                        "bbox": [tx0, ty0, tx1, ty1],
+                        "text": "\n".join(" | ".join(r) for r in rows_g),
+                        "confidence": 0.98,
+                        "style": {"fontFamily": page_font_family, "fontSizePt": 12.0, "textAlign": "left", "bold": False},
+                        "tableData": {"headers": rows_g[0], "rows": rows_g[1:]},
+                        "is_indented": False,
+                        "standalone_line": True,
+                    })
+                    LOG.info("  ✓ TableLineNet (Barrier DBNet+VietOCR): bảng %dx%d ô tại y=%d..%d.", grid.n_rows, grid.n_cols, ty0, ty1)
+            except Exception as net_tbl_exc:
+                LOG.warning("TableLineNet bỏ qua: %s", net_tbl_exc)
+
+        def _detect_tables_opencv_fallback():
             _, bw_table = cv2.threshold(gray_full, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
             h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(75, width // 9), 1))
             v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(42, height // 22)))
@@ -1296,8 +1426,12 @@ class OCREngine:
                         "standalone_line": True,
                     })
                     LOG.info("  ✓ Tự động phát hiện & tái tạo Bảng biểu (%dx%d ô) tại y=%d..%d.", len(rendered_rows), n_cols, ty, ty + th)
-        except Exception as tbl_exc:
-            LOG.debug("Phát hiện bảng tự động bỏ qua: %s", tbl_exc)
+
+        if not detected_tables:
+            try:
+                _detect_tables_opencv_fallback()
+            except Exception as tbl_exc:
+                LOG.debug("Phát hiện bảng tự động bỏ qua: %s", tbl_exc)
 
         import re
         line_items = []
@@ -1397,22 +1531,39 @@ class OCREngine:
                 if block_type not in ("heading", "table", "list"):
                     block_type = "paragraph"
 
-            # Gán cỡ chữ phân cấp chuẩn xác & đồng nhất trên toàn trang (11.5pt .. 16.0pt)
-            if is_main_title:
-                estimated_pt = 15.5 if (is_chapter_prefix or by1 < height * 0.35) else 16.0
-            elif is_level1_heading:
-                estimated_pt = 14.0
-            elif is_level2_heading:
-                estimated_pt = 13.5
-            elif is_level3_heading:
-                estimated_pt = 13.0
-            elif is_page_num:
+            # Ước lượng cỡ chữ tỷ lệ thực: đoạn văn chuẩn giữ đồng nhất 13.0pt (tránh nhảy cỡ do dao động khung DBNet),
+            # chỉ phóng đại theo pixel thực đối với tiêu đề/khối lớn (ratio_h >= 1.38 hoặc heading) và thu nhỏ cho chú thích/số trang.
+            line_h = float(by2 - by1)
+            ratio_h = line_h / max(12.0, median_body_h)
+            body_pt = 13.0
+            pixel_pt = round(min(24.0, max(10.0, body_pt * (ratio_h ** 0.88))) * 2.0) / 2.0
+            ai_pt = float(typo.get("fontSizePt", pixel_pt))
+
+            if is_page_num:
                 estimated_pt = 11.5
+            elif block_type == "heading" or ratio_h >= 1.38:
+                estimated_pt = round(min(24.0, max(13.5, 0.72 * pixel_pt + 0.28 * ai_pt)) * 2.0) / 2.0
+            elif ratio_h <= 0.68 and b_width < col_width * 0.55:
+                estimated_pt = round(max(10.0, min(12.0, pixel_pt)) * 2.0) / 2.0
             else:
-                estimated_pt = 13.0
+                estimated_pt = body_pt
+
+            # Giữ phân cấp tối thiểu cho tiêu đề mục rõ ràng
+            if is_main_title:
+                estimated_pt = max(estimated_pt, 16.0 if not is_chapter_prefix else 15.5)
+            elif is_level1_heading:
+                estimated_pt = max(estimated_pt, 14.5)
+            elif is_level2_heading:
+                estimated_pt = max(estimated_pt, 14.0)
+            elif is_level3_heading:
+                estimated_pt = max(estimated_pt, 13.5)
+
+            line_font_family = typo.get("fontFamily", page_font_family)
+            if b_width < col_width * 0.28:
+                line_font_family = page_font_family
 
             style_meta = {
-                "fontFamily": page_font_family,
+                "fontFamily": line_font_family,
                 "fontSizePt": estimated_pt,
             }
 
@@ -1442,9 +1593,9 @@ class OCREngine:
                 style_meta["textAlign"] = "justify" if b_width > col_width * 0.65 else "left"
                 if is_indented:
                     style_meta["isIndented"] = True
-                if is_uppercase or normalized_text.startswith("Điều ") or (typo.get("bold", False) and b_width < col_width * 0.70 and sw_r >= median_page_sw * 1.22):
+                if is_uppercase or normalized_text.startswith("Điều ") or typo.get("bold", False):
                     style_meta["bold"] = True
-                if typo.get("italic", False) and rel_slant >= 9.0:
+                if typo.get("italic", False):
                     style_meta["italic"] = True
                 if has_ul:
                     style_meta["underline"] = True
@@ -1453,7 +1604,7 @@ class OCREngine:
                 # Phát hiện cụm mở đầu đoạn văn in nghiêng hoặc in đậm (Inline Lead-in Italic/Bold)
                 if not style_meta.get("bold") and not style_meta.get("italic") and "*" not in normalized_text:
                     lead_match = re.match(
-                        r"^((?:Phương pháp|Các phương pháp|Về mặt|Một là|Hai là|Ba là|Bốn là|Thứ nhất|Thứ hai|-\s*[^:]{2,35})[^.:]{0,45}[.:])(\s+.*)?$",
+                        r"^((?:Phương pháp|Các phương pháp|Về mặt|Một là|Hai là|Ba là|Bốn là|Năm là|Thứ nhất|Thứ hai|-\s*[^:]{2,35})[^.:]{0,45}[.:])(\s+.*)?$",
                         normalized_text,
                     )
                     if lead_match:
@@ -1563,6 +1714,9 @@ class OCREngine:
                 prev["bbox"] = [min(px1, cx1), min(py1, cy1), max(px2, cx2), max(py2, cy2)]
                 prev["confidence"] = round((prev["confidence"] + item["confidence"]) / 2.0, 3)
                 prev["style"]["textAlign"] = "justify"
+                prev.setdefault("_b_votes", []).append(1 if item["style"].get("bold") else 0)
+                prev.setdefault("_i_votes", []).append(1 if item["style"].get("italic") else 0)
+                prev.setdefault("_sizes", []).append(float(item["style"].get("fontSizePt", 13.0)))
             else:
                 blk = {
                     "id": f"b-{len(blocks) + 1}-{uuid.uuid4().hex[:6]}",
@@ -1573,12 +1727,30 @@ class OCREngine:
                     "confidence": round(item["confidence"], 3),
                     "style": dict(item["style"]),
                     "_standalone": item.get("standalone_line", False),
+                    "_b_votes": [1 if item["style"].get("bold") else 0],
+                    "_i_votes": [1 if item["style"].get("italic") else 0],
+                    "_sizes": [float(item["style"].get("fontSizePt", 13.0))],
                 }
                 if "tableData" in item:
                     blk["tableData"] = item["tableData"]
                 blocks.append(blk)
 
         for blk in blocks:
+            b_votes = blk.pop("_b_votes", [])
+            i_votes = blk.pop("_i_votes", [])
+            sizes_blk = blk.pop("_sizes", [])
+            if len(b_votes) >= 2 and blk.get("type") == "paragraph":
+                if sum(b_votes) / len(b_votes) >= 0.55:
+                    blk["style"]["bold"] = True
+                else:
+                    blk["style"].pop("bold", None)
+                if sum(i_votes) / len(i_votes) >= 0.55:
+                    blk["style"]["italic"] = True
+                else:
+                    blk["style"].pop("italic", None)
+            if len(sizes_blk) >= 2 and blk.get("type") == "paragraph":
+                med_pt = round(float(np.median(sizes_blk)) * 2.0) / 2.0
+                blk["style"]["fontSizePt"] = med_pt
             blk.pop("_standalone", None)
 
         if not blocks:

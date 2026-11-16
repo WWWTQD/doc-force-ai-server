@@ -137,6 +137,7 @@ class ScanPipeline:
             else:
                 restored, deskew_matrix = geometry.image, np.eye(3, dtype=np.float64)
             transform = deskew_matrix @ geometry.transform
+            pre_unet_table_img = restored
 
             try:
                 LOG.info("  -> Khôi phục ảnh bằng DocumentRestorationUNet v5 (tile=512, overlap=64)...")
@@ -155,15 +156,27 @@ class ScanPipeline:
                         interpolation=cv2.INTER_CUBIC,
                     )
                 restored = unet_restored
+                ocr_input_img = restored
             except Exception as exc:
-                LOG.warning("  Cảnh báo: Khôi phục ảnh U-Net v5 gặp lỗi (%s), fallback sang ImagePreprocessor.", exc)
+                LOG.warning("  Cảnh báo: Khôi phục ảnh U-Net v5 gặp lỗi (%s), giữ nguyên ảnh camera tự nhiên cho OCR.", exc)
+                ocr_input_img = pre_unet_table_img
                 restored, deskew_matrix = self.preprocessor.enhance(geometry.image)
                 transform = deskew_matrix @ geometry.transform
         else:
+            # Tắt bilateralFilter + cắt ngưỡng cứng cho OCR: giữ trọn nét dấu thanh tiếng Việt sắc nét từ ảnh camera gốc
+            import cv2
             restored, deskew_matrix = self.preprocessor.enhance(geometry.image)
             transform = deskew_matrix @ geometry.transform
+            pre_unet_table_img = cv2.warpAffine(
+                geometry.image,
+                deskew_matrix[:2],
+                (restored.shape[1], restored.shape[0]),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+            ocr_input_img = pre_unet_table_img
 
-        layout = self.ocr_engine.process_image(restored, page_number)
+        layout = self.ocr_engine.process_image(ocr_input_img, page_number, table_ref_img=pre_unet_table_img)
         layout["scan"] = geometry.to_metadata()
         return PageScanResult(layout=layout, restored_image=restored, geometry=geometry, transform=transform)
 

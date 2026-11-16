@@ -226,11 +226,12 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train-samples", type=int, default=1600)
-    parser.add_argument("--val-samples", type=int, default=320)
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--train-samples", type=int, default=2400)
+    parser.add_argument("--val-samples", type=int, default=480)
+    parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=1.5e-3)
+    parser.add_argument("--lr", type=float, default=8e-4)
+    parser.add_argument("--resume-weights", type=str, default="")
     args = parser.parse_args()
 
     try:
@@ -261,10 +262,17 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DeepDocumentTypographyResNet().to(device)
+    best_avg_acc = -1.0
+    if args.resume_weights and os.path.exists(args.resume_weights):
+        ckpt = torch.load(args.resume_weights, map_location=device)
+        model.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=False)
+        ab0, ai0, asf0, mae0 = evaluate(model, val_loader, device)
+        best_avg_acc = (ab0 + ai0 + asf0) / 3.0
+        print(f"[TypographyAI] Resume từ {args.resume_weights}: val Bold={ab0:.4f} Italic={ai0:.4f} Serif={asf0:.4f} SizeMAE={mae0:.2f}pt")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=2e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    best_avg_acc = -1.0
     for ep in range(1, args.epochs + 1):
         ep_t0 = time.time()
         model.train()
@@ -277,9 +285,9 @@ def main():
             pb, pi, ps, psz = model(x)
             loss = (
                 F.cross_entropy(pb, b, label_smoothing=0.03)
-                + F.cross_entropy(pi, it, label_smoothing=0.03)
+                + 1.8 * F.cross_entropy(pi, it, label_smoothing=0.03)
                 + F.cross_entropy(ps, sf, label_smoothing=0.03)
-                + 0.15 * F.smooth_l1_loss(psz, sz)
+                + 0.08 * F.smooth_l1_loss(psz, sz)
             )
             loss.backward()
             optimizer.step()
