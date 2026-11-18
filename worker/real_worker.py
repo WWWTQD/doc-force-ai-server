@@ -78,6 +78,7 @@ from dotenv import load_dotenv
 from preprocessor import ImagePreprocessor
 from ocr_engine import OCREngine
 from document_scanner import DocumentScanner, map_layout_to_original
+from job_progress import VALID_HEARTBEAT_STAGES, compute_progress, parse_scan_options
 from scan_pipeline import ScanPipeline
 
 # Cài đặt python-docx nếu có
@@ -90,8 +91,8 @@ try:
 except ImportError:
     pass
 
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"), override=True)
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=True)
 
 def _configure_worker_logging(clear_file: bool = False):
     root = logging.getLogger()
@@ -129,9 +130,10 @@ _default_storage = "/data/storage" if os.path.isdir("/data/storage") else ""
 SHARED_STORAGE_ROOT = os.environ.get("SHARED_STORAGE_ROOT", _default_storage).strip()
 ENABLE_MAGIC_FILTER = os.environ.get("ENABLE_MAGIC_FILTER", "true").lower() != "false"
 ENABLE_DOCUMENT_SCAN = os.environ.get("ENABLE_DOCUMENT_SCAN", "true").lower() != "false"
-_has_cuda = bool(torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available())
-ENABLE_IMAGE_RESTORATION = _has_cuda or (os.environ.get("FORCE_UNET_CPU", "false").lower() == "true")
-PIPELINE_VERSION = "real-worker-unet-docscan-paddleocr-v2.2"
+_env_restoration = os.environ.get("ENABLE_IMAGE_RESTORATION", "true")
+ENABLE_IMAGE_RESTORATION = _env_restoration.strip().lower() not in ("0", "false", "no", "off")
+ENABLE_LLM_POSTPROCESS = os.environ.get("ENABLE_LLM_POSTPROCESS", os.environ.get("LLM_POSTPROCESS_ENABLED", "true")).lower() != "false"
+PIPELINE_VERSION = "real-worker-unet-v5.1-gemini-postocr-v2.3"
 
 STOP = threading.Event()
 
@@ -181,25 +183,50 @@ def _get_json(path: str, lease_token: str, timeout: int = 15) -> dict:
 
 
 class HeartbeatThread(threading.Thread):
-    def __init__(self, job_id: str, lease_token: str, stage: str = "OCR"):
+    def __init__(self, job_id: str, lease_token: str, stage: str = "OCR", progress: int = 5):
         super().__init__(daemon=True)
         self.job_id = job_id
         self.lease_token = lease_token
-        self.stage = stage
+        self._lock = threading.Lock()
+        self.stage = stage if stage in VALID_HEARTBEAT_STAGES else "OCR"
+        self.progress = max(0, min(99, int(progress)))
         self._stop_evt = threading.Event()
         self.consecutive_fails = 0
         self.failed = False
 
+    def update(self, progress: int | None = None, stage: str | None = None) -> None:
+        with self._lock:
+            if stage is not None and stage in VALID_HEARTBEAT_STAGES:
+                self.stage = stage
+            if progress is not None:
+                clamped = max(5, min(95, int(progress)))
+                if clamped > self.progress:
+                    self.progress = clamped
+        self._send_beat()
+
     def _send_beat(self):
+        if self._stop_evt.is_set():
+            return
+        with self._lock:
+            stage = self.stage
+            progress = self.progress
         try:
             _post(
                 f"/api/worker/jobs/{self.job_id}/heartbeat",
-                {"leaseToken": self.lease_token, "progress": 50, "stage": self.stage},
+                {"leaseToken": self.lease_token, "progress": progress, "stage": stage},
                 lease_token=self.lease_token,
             )
-            LOG.debug("Heartbeat OK — job %s", self.job_id)
+            LOG.debug("Heartbeat OK — job %s (stage=%s, progress=%d)", self.job_id, stage, progress)
             self.consecutive_fails = 0
+        except requests.exceptions.HTTPError as exc:
+            if self._stop_evt.is_set() or (exc.response is not None and exc.response.status_code == 409):
+                self._stop_evt.set()
+                return
+            self.consecutive_fails += 1
+            LOG.warning("Heartbeat cảnh báo (lần %d) — job %s: %s", self.consecutive_fails, self.job_id, exc)
         except Exception as exc:
+            if self._stop_evt.is_set():
+                return
             self.consecutive_fails += 1
             LOG.warning("Heartbeat cảnh báo (lần %d) — job %s: %s", self.consecutive_fails, self.job_id, exc)
 
@@ -277,7 +304,7 @@ def _save_restored_image(job: dict, page_id: str, img) -> str | None:
     Trả về storage key, hoặc None nếu không ghi được.
     """
     try:
-        ok, encoded = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        ok, encoded = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 98])
         if not ok:
             raise ValueError("Không encode được ảnh phục hồi")
         image_bytes = encoded.tobytes()
@@ -338,9 +365,26 @@ def _process_ocr_job(job: dict, pipeline: ScanPipeline):
     job_id = job["jobId"]
     lease_token = job["leaseToken"]
     pages = job.get("pages", [])
+    n_pages = max(1, len(pages))
+    job_options = parse_scan_options(
+        job,
+        default_llm=ENABLE_LLM_POSTPROCESS,
+        default_unet=ENABLE_IMAGE_RESTORATION,
+    )
 
-    LOG.info("══ [OCR JOB %s] Bắt đầu xử lý (%d trang) ══", job_id, len(pages))
-    heartbeat = HeartbeatThread(job_id, lease_token, stage="OCR")
+    LOG.info(
+        "══ [OCR JOB %s] Bắt đầu xử lý (%d trang, useUnet=%s, useLlm=%s) ══",
+        job_id,
+        len(pages),
+        job_options.get("useUnet"),
+        job_options.get("llmPostprocess"),
+    )
+    heartbeat = HeartbeatThread(
+        job_id,
+        lease_token,
+        stage="PREPROCESSING",
+        progress=compute_progress(0, n_pages, "PREPROCESSING"),
+    )
     heartbeat.start()
 
     try:
@@ -360,15 +404,27 @@ def _process_ocr_job(job: dict, pipeline: ScanPipeline):
                 lease_token=lease_token,
             )
 
-            # 1. Bắt tờ giấy + nắn phẳng + xoay -> 2. Deskew/Denoise/Magic Color -> 3. U-Net Restoration -> 4. Layout + OCR
-            LOG.info("  -> Scan tài liệu (detect, warp, orient, enhance) + U-Net Restoration + OCR...")
-            result = pipeline.process_bytes(image_bytes, page_number)
+            # 1. Bắt tờ giấy + nắn phẳng + xoay -> 2. Deskew/Denoise/Magic Color hoặc U-Net v5.1 -> 3. Layout + OCR -> 4. Gemini Post-OCR
+            LOG.info(
+                "  -> Scan tài liệu + %s + OCR%s...",
+                "U-Net v5.1 Hybrid" if job_options.get("useUnet") else "OpenCV Magic Enhance",
+                " + Gemini Post-OCR" if job_options.get("llmPostprocess") else "",
+            )
+            result = pipeline.process_bytes(
+                image_bytes,
+                page_number,
+                options=job_options,
+                progress_cb=lambda stg, _i=idx - 1: heartbeat.update(
+                    progress=compute_progress(_i, n_pages, stg),
+                    stage=stg,
+                ),
+            )
 
             # Upload ảnh phục hồi lên Backend (/restored) hoặc ghi trực tiếp vào SHARED_STORAGE_ROOT (/data/storage)
             restored_key = _save_restored_image(job, page_id, result.restored_image)
             if result.geometry.rotation in (90, 180, 270) and job.get("documentId"):
                 try:
-                    ok_orig, enc_orig = cv2.imencode(".jpg", result.geometry.image, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                    ok_orig, enc_orig = cv2.imencode(".jpg", result.geometry.image, [int(cv2.IMWRITE_JPEG_QUALITY), 98])
                     if ok_orig:
                         orig_key = f"documents/{job['documentId']}/pages/{page_id}/original.jpg"
                         orig_bytes = enc_orig.tobytes()
@@ -873,18 +929,27 @@ def main():
     _configure_worker_logging(clear_file=True)
     LOG.info("Backend URL: %s | Worker ID: %s | Poll interval: %.0fs", BACKEND_URL, WORKER_INSTANCE_ID, POLL_INTERVAL)
 
-    # Khởi tạo DocumentRestorationUNet v5
+    # Khởi tạo sẵn DocumentRestorationUNet v5.1 trong RAM để sẵn sàng khi người dùng bật useUnet=true trên UI
     restoration_service = None
-    if ENABLE_IMAGE_RESTORATION:
-        try:
-            from app.services.restoration_service import RestorationService
-            restoration_service = RestorationService.get_instance()
-            if restoration_service.is_available:
-                LOG.info("✓ DocumentRestorationUNet v5 đã sẵn sàng!")
-            else:
-                LOG.warning("DocumentRestorationUNet chưa có trọng số khả dụng.")
-        except Exception as exc:
-            LOG.warning("Không thể khởi tạo RestorationService: %s", exc)
+    try:
+        from app.services.restoration_service import RestorationService
+        restoration_service = RestorationService.get_instance()
+        if restoration_service.is_available:
+            LOG.info(
+                "✓ DocumentRestorationUNet v5.1 (Stroke-Preserving Hybrid) đã sẵn sàng! (Mặc định tự động: %s)",
+                "BẬT" if ENABLE_IMAGE_RESTORATION else "TẮT - bật linh hoạt qua useUnet",
+            )
+        else:
+            LOG.warning("DocumentRestorationUNet chưa có trọng số khả dụng.")
+    except Exception as exc:
+        LOG.warning("Không thể khởi tạo RestorationService: %s", exc)
+
+    LOG.info(
+        "✓ Gemini Post-OCR (llm_postprocessor): mặc định=%s | model=%s | fallback=%s",
+        "BẬT" if ENABLE_LLM_POSTPROCESS else "TẮT",
+        os.environ.get("LLM_MODEL", "gemini-3.5-flash-lite"),
+        os.environ.get("LLM_FALLBACK_MODEL", "gemini-3.1-flash-lite,gemini-3.5-flash"),
+    )
 
     preprocessor = ImagePreprocessor(enable_magic=ENABLE_MAGIC_FILTER)
     ocr_engine = OCREngine(lang="vi")

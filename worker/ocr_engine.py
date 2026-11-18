@@ -702,19 +702,44 @@ class OCREngine:
 
             h_box = float(0.5 * (np.linalg.norm(pts[0] - pts[3]) + np.linalg.norm(pts[1] - pts[2])))
             raw_items.append((ym, x1, pts, h_box))
-            if bw > width * 0.15 and 22.0 <= h_box <= ih * 0.045:
+            if bw > width * 0.15 and 22.0 <= h_box <= ih * 0.036:
                 single_line_heights.append(h_box)
 
         if not raw_items:
             return []
 
+        max_single_h = max(88.0, float(ih) * 0.036)
         if single_line_heights:
-            single_h = float(np.clip(np.median(single_line_heights), 32.0, 64.0))
+            single_h = float(np.clip(np.median(single_line_heights), 26.0, max_single_h))
         else:
             all_h = [it[3] for it in raw_items]
-            single_h = float(np.clip(np.median(all_h), 32.0, 64.0))
+            single_h = float(np.clip(np.median(all_h), 26.0, max_single_h))
 
-        split_thresh = max(68.0, single_h * 1.56)
+        # _rotate_crop cộng thêm 2 * pad_y (~0.32 * single_h), nên dòng đơn thực tế có ch ~ 1.32-1.48 * single_h
+        # và box gộp 2 dòng có ch >= 1.95 * single_h. Đặt split_thresh = max(68.0, single_h * 1.68)
+        # đảm bảo tuyệt đối không cắt ngang dòng đơn mà vẫn tách chính xác mọi box gộp 2 dòng.
+        split_thresh = max(68.0, single_h * 1.68)
+
+        # Ước lượng độ dốc nghiêng cục bộ (local tilt slope dy/dx) theo vùng Y của trang từ các dòng rộng
+        # để chuẩn hóa toạ độ Y chính xác ngay cả khi trang sách hơi cong ở đầu/cuối trang.
+        wide_slopes: list[tuple[float, float]] = []
+        for ym_s, _, pts_s, _ in raw_items:
+            bw_s = float(max(pts_s[:, 0]) - min(pts_s[:, 0]))
+            if bw_s > width * 0.30:
+                dx_top = float(pts_s[1, 0] - pts_s[0, 0])
+                dy_top = float(pts_s[1, 1] - pts_s[0, 1])
+                if dx_top > 40.0:
+                    wide_slopes.append((float(ym_s), float(np.clip(dy_top / dx_top, -0.12, 0.12))))
+        page_tilt_slope = float(np.median([s for _, s in wide_slopes])) if wide_slopes else 0.0
+
+        def _local_tilt_slope(y_q: float) -> float:
+            if not wide_slopes:
+                return 0.0
+            win_y = max(420.0, float(ih) * 0.16)
+            near = [s for ym_s, s in wide_slopes if abs(ym_s - y_q) <= win_y]
+            if near:
+                return float(np.median(near))
+            return page_tilt_slope
 
         def _split_multiline_crop(ym_val: float, pts_arr: np.ndarray, crop_img: np.ndarray) -> list[tuple[float, np.ndarray, np.ndarray]]:
             """Tách đệ quy một box bị DBNet gộp dọc (2..N dòng) thành từng dòng đơn độc lập mà tuyệt đối không cắt đôi dòng đơn."""
@@ -800,31 +825,47 @@ class OCREngine:
                 sch, scw = sub_crop.shape[:2]
                 if sch < 8 or scw < 8 or sch > scw * 2.8:
                     continue
+                # Lọc bỏ box bóng chữ thấu mực rất mờ trên ảnh scan lớn (không có lõi nét chữ mặt trước)
+                if max(ih, width) >= 900:
+                    sc_gray = cv2.cvtColor(sub_crop, cv2.COLOR_BGR2GRAY) if sub_crop.ndim == 3 else sub_crop
+                    p5_ink = float(np.percentile(sc_gray, 5))
+                    p85_bg = float(np.percentile(sc_gray, 85))
+                    if p5_ink > 152.0 and (p85_bg - p5_ink) < 62.0:
+                        continue
                 sxs = sub_poly[:, 0]
                 sx1, sx2 = float(min(sxs)), float(max(sxs))
                 if is_book_page and sx2 < max(110.0, col_left_est - 25.0):
                     continue
-                single_items.append((sub_y, sx1, sx2, sub_poly, sub_crop))
+                sxm = 0.5 * (sx1 + sx2)
+                loc_slope = _local_tilt_slope(float(sub_y))
+                sub_y_norm = float(sub_y) - loc_slope * (sxm - col_left_est)
+                single_items.append((sub_y_norm, float(sub_y), sx1, sx2, sub_poly, sub_crop))
 
         if not single_items:
             return []
 
-        # Bước 2: Sắp xếp từ trên xuống dưới, khử trùng lặp và gom các mảnh cùng 1 dòng ngang
+        # Bước 2: Sắp xếp theo toạ độ Y đã bù góc nghiêng trang (sub_y_norm), khử trùng lặp và gom các mảnh cùng 1 dòng ngang
         single_items.sort(key=lambda it: it[0])
-        line_clusters: list[list[tuple[float, float, float, np.ndarray, np.ndarray]]] = []
+        line_clusters: list[list[tuple[float, float, float, float, np.ndarray, np.ndarray]]] = []
         for item in single_items:
-            sub_y, sx1, sx2, sub_poly, sub_crop = item
+            sub_y_norm, sub_y_raw, sx1, sx2, sub_poly, sub_crop = item
+            sw = max(1.0, sx2 - sx1)
             placed = False
             for cluster in line_clusters:
-                mean_y = float(np.mean([c[0] for c in cluster]))
-                if abs(sub_y - mean_y) < single_h * 0.42:
+                mean_y_norm = float(np.mean([c[0] for c in cluster]))
+                max_x_ov = max((min(sx2, c[3]) - max(sx1, c[2])) for c in cluster)
+                # Hai mảnh nằm cạnh nhau (không đè X, ví dụ "TIN MIỀN BẮC PHÁT ĐÊM") cho phép sai số Y 0.55 * single_h;
+                # hai dòng chồng lấp X chỉ cùng cluster khi chênh lệch Y đã bù nghiêng < 0.42 * single_h.
+                same_horiz_row = (abs(sub_y_norm - mean_y_norm) < single_h * 0.42) or (
+                    max_x_ov <= 0.15 * sw and abs(sub_y_norm - mean_y_norm) < single_h * 0.55
+                )
+                if same_horiz_row:
                     # Kiểm tra có trùng lặp ngang với mảnh đã có trong dòng không
-                    sw = max(1.0, sx2 - sx1)
                     is_dup = False
-                    for idx_c, (cy, cx1, cx2, cpoly, ccrop) in enumerate(cluster):
+                    for idx_c, (cyn, cyr, cx1, cx2, cpoly, ccrop) in enumerate(cluster):
                         ew = max(1.0, cx2 - cx1)
                         x_ov = min(sx2, cx2) - max(sx1, cx1)
-                        if x_ov > 0.42 * min(sw, ew):
+                        if x_ov > 0.42 * min(sw, ew) and abs(sub_y_norm - cyn) < single_h * 0.40:
                             # Giữ mảnh rộng hơn
                             if sw > ew * 1.08:
                                 cluster[idx_c] = item
@@ -837,21 +878,22 @@ class OCREngine:
             if not placed:
                 line_clusters.append([item])
 
-        # Sắp xếp các dòng theo Y và các mảnh trong từng dòng theo X từ trái sang phải
+        # Sắp xếp các dòng theo Y đã bù nghiêng và các mảnh trong từng dòng theo X từ trái sang phải
         line_clusters.sort(key=lambda cl: float(np.mean([c[0] for c in cl])))
 
         # Bước 3: Chuẩn bị danh sách ảnh từng dòng đưa vào VietOCR theo batch (giữ nguyên toàn dòng để mô hình seq2seq có ngữ cảnh đầy đủ)
         line_polys: list[np.ndarray] = []
+        line_y_norms: list[float] = []
         line_piece_ranges: list[tuple[int, int]] = []
         all_pil_pieces: list[Image.Image] = []
 
         for cluster in line_clusters:
-            cluster.sort(key=lambda c: c[1])
+            cluster.sort(key=lambda c: c[2])
             # Lọc bỏ mảnh cách quá xa ở rìa phải (chữ nháp lề phải)
             filtered_cl = []
             for item in cluster:
-                sub_y, sx1, sx2, sub_poly, sub_crop = item
-                if filtered_cl and (sx1 - filtered_cl[-1][2]) > width * 0.22 and (sx2 - sx1) < 220:
+                sub_y_norm, sub_y_raw, sx1, sx2, sub_poly, sub_crop = item
+                if filtered_cl and (sx1 - filtered_cl[-1][3]) > width * 0.22 and (sx2 - sx1) < 220:
                     continue
                 filtered_cl.append(item)
             if not filtered_cl:
@@ -859,14 +901,15 @@ class OCREngine:
 
             # Gộp polygon của các mảnh trên cùng 1 dòng (giữ đúng chiều cao vuông góc thực tế của dòng)
             if len(filtered_cl) == 1:
-                merged_poly = filtered_cl[0][3]
+                merged_poly = filtered_cl[0][4]
             else:
-                p_first = filtered_cl[0][3]
-                p_last = filtered_cl[-1][3]
+                p_first = filtered_cl[0][4]
+                p_last = filtered_cl[-1][4]
                 merged_poly = np.array([p_first[0], p_last[1], p_last[2], p_first[3]], dtype=np.float32)
 
+            cluster_y_norm = float(np.mean([c[0] for c in filtered_cl]))
             start_idx = len(all_pil_pieces)
-            for _, _, _, _, seg_crop in filtered_cl:
+            for _, _, _, _, _, seg_crop in filtered_cl:
                 wch, wcw = seg_crop.shape[:2]
                 # Giữ nguyên toàn bộ 1 dòng để VietOCR (vgg_seq2seq) đọc trọn vẹn ngữ cảnh từ đầu đến cuối dòng,
                 # tuyệt đối không cắt ngang làm gãy đôi từ hoặc rơi chữ ở giữa dòng.
@@ -876,6 +919,7 @@ class OCREngine:
             end_idx = len(all_pil_pieces)
             if end_idx > start_idx:
                 line_polys.append(merged_poly)
+                line_y_norms.append(cluster_y_norm)
                 line_piece_ranges.append((start_idx, end_idx))
 
         if not all_pil_pieces:
@@ -913,8 +957,13 @@ class OCREngine:
                 except Exception:
                     piece_probs[orig_idx] = 0.85
 
+        try:
+            from vietnamese_syllable_validator import invalid_syllables
+        except ImportError:
+            from worker.vietnamese_syllable_validator import invalid_syllables
+
         out = []
-        for poly, (s_i, e_i) in zip(line_polys, line_piece_ranges):
+        for poly, y_norm_val, (s_i, e_i) in zip(line_polys, line_y_norms, line_piece_ranges):
             valid_sub_txts = []
             valid_sub_probs = []
             n_sub = e_i - s_i
@@ -925,7 +974,7 @@ class OCREngine:
                     continue
                 if is_gibberish_or_handwriting_text(t_sub):
                     continue
-                if p_sub < 0.25 and (n_sub > 1 and idx_p == e_i - 1):
+                if p_sub < 0.16 and (n_sub > 1 and idx_p == e_i - 1) and not t_sub.isupper():
                     continue
                 valid_sub_txts.append(t_sub)
                 valid_sub_probs.append(p_sub)
@@ -938,7 +987,16 @@ class OCREngine:
             avg_prob = float(np.mean(valid_sub_probs)) if valid_sub_probs else 0.90
             if avg_prob < 0.35 or (avg_prob < 0.45 and len(full_line_text) < 12 and not full_line_text.isdigit()):
                 continue
-            out.append([np.asarray(poly).tolist(), (full_line_text, round(avg_prob, 3))])
+            # Lọc bỏ dòng bóng chữ thấu mực có độ tin cậy thấp (conf < 0.58) đi kèm tỷ lệ từ vô nghĩa / số rời rạc cao
+            if avg_prob < 0.58 and not full_line_text.isdigit():
+                words_line = full_line_text.split()
+                alpha_words = [w for w in words_line if any(ch.isalpha() for ch in w)]
+                inv_cnt = len(invalid_syllables(full_line_text, allow_loanwords=True))
+                vi_score = 1.0 - (inv_cnt / float(max(1, len(alpha_words))))
+                num_toks = sum(1 for w in words_line if any(ch.isdigit() for ch in w))
+                if vi_score < 0.45 or (len(words_line) >= 4 and num_toks >= 3 and vi_score < 0.65):
+                    continue
+            out.append([np.asarray(poly).tolist(), (full_line_text, round(avg_prob, 3), float(y_norm_val))])
         return out
 
     def _run_paddle_ocr(
@@ -960,7 +1018,12 @@ class OCREngine:
         raw_boxes = []
         if results and len(results) > 0 and results[0] is not None:
             for line in results[0]:
-                poly, (text, confidence) = line
+                poly, rec_info = line
+                if len(rec_info) == 3:
+                    text, confidence, y_norm_line = rec_info
+                else:
+                    text, confidence = rec_info
+                    y_norm_line = None
                 pts_poly = _order_poly(poly)
                 xs = pts_poly[:, 0]
                 ys = pts_poly[:, 1]
@@ -982,10 +1045,11 @@ class OCREngine:
                     "text": text.strip(),
                     "confidence": float(confidence),
                     "height_px": y2 - y1,
+                    "y_norm": float(y_norm_line) if y_norm_line is not None else float(ym),
                 })
 
-        # Sắp xếp các dòng theo vị trí Y tăng dần
-        raw_boxes.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
+        # Sắp xếp các dòng theo vị trí Y đã bù góc nghiêng tăng dần
+        raw_boxes.sort(key=lambda b: (b.get("y_norm", b["bbox"][1]), b["bbox"][0]))
 
         # Ánh xạ class_name của YOLO → block_type của Doc Forge
         _YOLO_CLASS_MAP = {
@@ -1451,14 +1515,26 @@ class OCREngine:
             # Bỏ qua mảnh chữ nháp rất ngắn nằm lơ lửng không phải số trang hay tiêu đề
             is_page_num = len(normalized_text) <= 4 and normalized_text.isdigit() and by1 > height * 0.80
             is_chapter_prefix = bool(re.match(r"^(Chương|CHƯƠNG|Phần|PHẦN)\s+\d+", normalized_text))
-            if b_width < col_width * 0.16 and not is_page_num and not is_chapter_prefix and len(normalized_text) < 12 and b["confidence"] < 0.82:
+            is_top_header_piece = normalized_text.isupper() and by1 < height * 0.25 and len(normalized_text) >= 2
+            if (
+                b_width < col_width * 0.16
+                and not is_page_num
+                and not is_chapter_prefix
+                and not is_top_header_piece
+                and len(normalized_text) < 12
+                and b["confidence"] < 0.82
+            ):
                 continue
 
-            # Lọc bỏ dòng trùng lặp bị đè toạ độ Y
+            cur_y_norm = float(b.get("y_norm", 0.5 * (by1 + by2)))
+            # Lọc bỏ dòng trùng lặp thực sự (cùng toạ độ Y đã bù nghiêng và chồng lấp ngang > 45%)
             if line_items:
                 prev_bx1, prev_by1, prev_bx2, prev_by2 = line_items[-1]["bbox"]
-                y_ov = min(by2, prev_by2) - max(by1, prev_by1)
-                if y_ov > 0.55 * min(by2 - by1, prev_by2 - prev_by1) and abs(bx1 - prev_bx1) < width * 0.25:
+                prev_y_norm = float(line_items[-1].get("y_norm", 0.5 * (prev_by1 + prev_by2)))
+                x_ov_line = min(bx2, prev_bx2) - max(bx1, prev_bx1)
+                min_w_line = max(1.0, float(min(bx2 - bx1, prev_bx2 - prev_bx1)))
+                min_h_line = max(1.0, float(min(by2 - by1, prev_by2 - prev_by1)))
+                if abs(cur_y_norm - prev_y_norm) < 0.42 * min_h_line and x_ov_line > 0.45 * min_w_line:
                     continue
 
             sw_r, slant_deg, serif_r = visual_metrics[idx_b] if idx_b < len(visual_metrics) else (median_page_sw, median_page_slant, median_page_serif)
@@ -1626,11 +1702,12 @@ class OCREngine:
                 "style": style_meta,
                 "is_indented": is_indented,
                 "standalone_line": bool(is_sub_italic_header or is_page_num or is_chapter_prefix),
+                "y_norm": cur_y_norm,
             })
 
         if detected_tables:
             line_items.extend(detected_tables)
-            line_items.sort(key=lambda it: (it["bbox"][1], it["bbox"][0]))
+            line_items.sort(key=lambda it: (it.get("y_norm", it["bbox"][1]), it["bbox"][0]))
 
         # Gộp các dòng liên tiếp thuộc cùng một đoạn văn hoặc tiêu đề dài bị tràn dòng (Paragraph & Wrapped-Heading Merging)
         blocks = []
@@ -1649,6 +1726,8 @@ class OCREngine:
                     "confidence": round(item["confidence"], 3),
                     "style": dict(item["style"]),
                     "_standalone": item.get("standalone_line", False),
+                    "_last_y_norm": float(item.get("y_norm", 0.5 * (item["bbox"][1] + item["bbox"][3]))),
+                    "_last_bbox": list(item["bbox"]),
                 }
                 if "tableData" in item:
                     blk["tableData"] = item["tableData"]
@@ -1657,11 +1736,32 @@ class OCREngine:
 
             prev = blocks[-1]
             px1, py1, px2, py2 = prev["bbox"]
+            lpx1, lpy1, lpx2, lpy2 = prev.get("_last_bbox", prev["bbox"])
             cx1, cy1, cx2, cy2 = item["bbox"]
-            v_gap = cy1 - py2
+            cur_yn = float(item.get("y_norm", 0.5 * (cy1 + cy2)))
+            prev_yn = float(prev.get("_last_y_norm", 0.5 * (lpy1 + lpy2)))
+            v_gap = min(cy1 - py2, (cur_yn - prev_yn) - median_body_h)
             prev_reached_right = px2 >= (dominant_right - col_width * 0.14)
 
-            # Kiểm tra trường hợp tiêu đề dài (ví dụ 1.2.3..., 3.3..., hoặc tiêu đề IN HOA) tràn sang dòng thứ 2
+            # 1. Gộp các mảnh rời rạc nằm trên cùng 1 hàng ngang (vertical overlap >= 50%, ví dụ: "TIN MIỀN BẮC PHÁT ĐÊM")
+            v_ov_row = min(lpy2, cy2) - max(lpy1, cy1)
+            min_h_row = max(1.0, float(min(lpy2 - lpy1, cy2 - cy1)))
+            same_row_cont = (
+                (v_ov_row >= 0.50 * min_h_row or abs(cur_yn - prev_yn) < median_body_h * 0.42)
+                and cx1 >= lpx2 - 35
+                and (cx1 - lpx2) <= width * 0.22
+                and "tableData" not in prev
+                and "tableData" not in item
+            )
+            if same_row_cont:
+                prev["text"] = f"{prev['text']} {item['text']}"
+                prev["bbox"] = [min(px1, cx1), min(py1, cy1), max(px2, cx2), max(py2, cy2)]
+                prev["confidence"] = round((prev["confidence"] + item["confidence"]) / 2.0, 3)
+                prev["_last_y_norm"] = 0.5 * (prev_yn + cur_yn)
+                prev["_last_bbox"] = [min(lpx1, cx1), min(lpy1, cy1), max(lpx2, cx2), max(lpy2, cy2)]
+                continue
+
+            # 2. Kiểm tra trường hợp tiêu đề dài (ví dụ 1.2.3..., 3.3..., hoặc tiêu đề IN HOA) tràn sang dòng thứ 2
             is_wrapped_heading_cont = False
             if (
                 prev["type"] == "heading"
@@ -1683,18 +1783,8 @@ class OCREngine:
                 prev["text"] = f"{prev['text']} {item['text']}"
                 prev["bbox"] = [min(px1, cx1), min(py1, cy1), max(px2, cx2), max(py2, cy2)]
                 prev["confidence"] = round((prev["confidence"] + item["confidence"]) / 2.0, 3)
-                continue
-
-            # Kiểm tra dòng đầu đoạn văn bị tách làm 2 mảnh ngang trên cùng toạ độ Y
-            same_row_cont = (
-                abs(cy1 - py2) < median_body_h * 0.35
-                and (min(py2, cy2) - max(py1, cy1)) > 0.45 * min(py2 - py1, cy2 - cy1)
-                and cx1 > px2 - 25
-            )
-            if same_row_cont:
-                prev["text"] = f"{prev['text']} {item['text']}"
-                prev["bbox"] = [min(px1, cx1), min(py1, cy1), max(px2, cx2), max(py2, cy2)]
-                prev["confidence"] = round((prev["confidence"] + item["confidence"]) / 2.0, 3)
+                prev["_last_y_norm"] = cur_yn
+                prev["_last_bbox"] = list(item["bbox"])
                 continue
 
             starts_new_para = (
@@ -1714,6 +1804,8 @@ class OCREngine:
                 prev["bbox"] = [min(px1, cx1), min(py1, cy1), max(px2, cx2), max(py2, cy2)]
                 prev["confidence"] = round((prev["confidence"] + item["confidence"]) / 2.0, 3)
                 prev["style"]["textAlign"] = "justify"
+                prev["_last_y_norm"] = cur_yn
+                prev["_last_bbox"] = list(item["bbox"])
                 prev.setdefault("_b_votes", []).append(1 if item["style"].get("bold") else 0)
                 prev.setdefault("_i_votes", []).append(1 if item["style"].get("italic") else 0)
                 prev.setdefault("_sizes", []).append(float(item["style"].get("fontSizePt", 13.0)))
@@ -1727,6 +1819,8 @@ class OCREngine:
                     "confidence": round(item["confidence"], 3),
                     "style": dict(item["style"]),
                     "_standalone": item.get("standalone_line", False),
+                    "_last_y_norm": cur_yn,
+                    "_last_bbox": list(item["bbox"]),
                     "_b_votes": [1 if item["style"].get("bold") else 0],
                     "_i_votes": [1 if item["style"].get("italic") else 0],
                     "_sizes": [float(item["style"].get("fontSizePt", 13.0))],
@@ -1739,6 +1833,8 @@ class OCREngine:
             b_votes = blk.pop("_b_votes", [])
             i_votes = blk.pop("_i_votes", [])
             sizes_blk = blk.pop("_sizes", [])
+            blk.pop("_last_y_norm", None)
+            blk.pop("_last_bbox", None)
             if len(b_votes) >= 2 and blk.get("type") == "paragraph":
                 if sum(b_votes) / len(b_votes) >= 0.55:
                     blk["style"]["bold"] = True
@@ -1752,6 +1848,20 @@ class OCREngine:
                 med_pt = round(float(np.median(sizes_blk)) * 2.0) / 2.0
                 blk["style"]["fontSizePt"] = med_pt
             blk.pop("_standalone", None)
+
+        # Đồng nhất fontFamily chủ đạo trên toàn trang cho các khối văn bản (paragraph)
+        page_fonts = [
+            b.get("style", {}).get("fontFamily")
+            for b in blocks
+            if b.get("style", {}).get("fontFamily")
+        ]
+        if page_fonts:
+            from collections import Counter
+            dom_font, dom_cnt = Counter(page_fonts).most_common(1)[0]
+            if dom_cnt / float(len(page_fonts)) >= 0.55:
+                for b in blocks:
+                    if b.get("type") == "paragraph" and "style" in b:
+                        b["style"]["fontFamily"] = dom_font
 
         if not blocks:
             # Nếu không tìm thấy chữ nào

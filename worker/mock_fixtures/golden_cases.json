@@ -1,0 +1,168 @@
+{
+  "text_llm": {
+    "Thi hn np đon đăng ký mua tài sán công něu trên, k t ngày ⟦T1⟧": {
+      "caseId": "GC1",
+      "rawOcr": "Thi hn np đon đăng ký mua tài sán công něu trên, k t ngày 06/01/2021",
+      "groundTruth": "Thời hạn nộp đơn đăng ký mua tài sản công nêu trên, kể từ ngày 06/01/2021",
+      "corrected": "Thời hạn nộp đơn đăng ký mua tài sản công nêu trên, kể từ ngày ⟦T1⟧",
+      "confidence": 0.96,
+      "changes": [
+        {"from": "Thi", "to": "Thời", "reason": "Khôi phục nguyên âm và dấu huyền"},
+        {"from": "hn", "to": "hạn", "reason": "Khôi phục nguyên âm a và dấu nặng"},
+        {"from": "np", "to": "nộp", "reason": "Khôi phục nguyên âm ô và dấu nặng"},
+        {"from": "đon", "to": "đơn", "reason": "Sửa o thành ơ"},
+        {"from": "sán", "to": "sản", "reason": "Sửa dấu sắc thành hỏi"},
+        {"from": "něu", "to": "nêu", "reason": "Sửa ký tự ě lỗi OCR"},
+        {"from": "k", "to": "kể", "reason": "Khôi phục âm tiết bị đứt nét"},
+        {"from": "t", "to": "từ", "reason": "Khôi phục âm tiết bị đứt nét"}
+      ]
+    },
+    "QLTT ngày ⟦T1⟧ cùa Đôi QLTT s ⟦T2⟧, vè vic xin ý kién phé duyět phuong": {
+      "caseId": "GC2",
+      "rawOcr": "QLTT ngày 06/01/2021 cùa Đôi QLTT s 4, vè vic xin ý kién phé duyět phuong",
+      "groundTruth": "QLTT ngày 06/01/2021 của Đội QLTT số 4, về việc xin ý kiến phê duyệt phương",
+      "corrected": "QLTT ngày ⟦T1⟧ của Đội QLTT số ⟦T2⟧, về việc xin ý kiến phê duyệt phương",
+      "confidence": 0.95,
+      "changes": [
+        {"from": "cùa", "to": "của", "reason": "Sửa dấu huyền thành hỏi"},
+        {"from": "Đôi", "to": "Đội", "reason": "Thêm dấu nặng"},
+        {"from": "s", "to": "số", "reason": "Khôi phục nguyên âm và dấu"},
+        {"from": "vè", "to": "về", "reason": "Sửa e thành ê"},
+        {"from": "vic", "to": "việc", "reason": "Khôi phục âm tiết mất nguyên âm"},
+        {"from": "kién", "to": "kiến", "reason": "Sửa e thành ê"},
+        {"from": "phé", "to": "phê", "reason": "Sửa thanh điệu"},
+        {"from": "duyět", "to": "duyệt", "reason": "Sửa ký tự ě lỗi OCR"},
+        {"from": "phuong", "to": "phương", "reason": "Khôi phục dấu râu ươ"}
+      ]
+    },
+    "tang vt vi phąm hành chinh tjch thu sung quý nhà nuóc theo Công văn s: ⟦T1⟧": {
+      "caseId": "GC3",
+      "rawOcr": "tang vt vi phąm hành chinh tjch thu sung quý nhà nuóc theo Công văn s: 20/CV-",
+      "groundTruth": "tang vật vi phạm hành chính tịch thu sung quỹ nhà nước theo Công văn số: 20/CV-QLTT",
+      "corrected": "tang vật vi phạm hành chính tịch thu sung quỹ nhà nước theo Công văn số: ⟦T1⟧",
+      "confidence": 0.93,
+      "changes": [
+        {"from": "vt", "to": "vật", "reason": "Khôi phục â và dấu nặng"},
+        {"from": "phąm", "to": "phạm", "reason": "Sửa ký tự ą lỗi OCR"},
+        {"from": "chinh", "to": "chính", "reason": "Thêm dấu sắc"},
+        {"from": "tjch", "to": "tịch", "reason": "Sửa j thành i và dấu nặng"},
+        {"from": "quý", "to": "quỹ", "reason": "Sửa dấu sắc thành ngã"},
+        {"from": "nuóc", "to": "nước", "reason": "Khôi phục dấu râu ươ"},
+        {"from": "s:", "to": "số:", "reason": "Khôi phục nguyên âm và dấu"}
+      ]
+    },
+    "Hài Phòng. ngày ⟦T1⟧ tháng ⟦T2⟧ năm ⟦T3⟧": {
+      "caseId": "GC4",
+      "rawOcr": "Hài Phòng. ngày th tháng 01 năm 2021",
+      "groundTruth": "Hải Phòng, ngày 05 tháng 01 năm 2021",
+      "corrected": "Hải Phòng, ngày ⟦T1⟧ tháng ⟦T2⟧ năm ⟦T3⟧",
+      "confidence": 0.94,
+      "changes": [
+        {"from": "Hài", "to": "Hải", "reason": "Sửa dấu huyền thành hỏi"},
+        {"from": "Phòng.", "to": "Phòng,", "reason": "Chuẩn hóa dấu phẩy sau địa danh"}
+      ]
+    },
+    "ngly ⟦T1⟧ thíng ⟦T2⟧ nim ⟦T3⟧": {
+      "caseId": "GC5",
+      "rawOcr": "ngly .. thíng 01 nim 2021",
+      "groundTruth": "ngày .. tháng 01 năm 2021",
+      "corrected": "ngày ⟦T1⟧ tháng ⟦T2⟧ năm ⟦T3⟧",
+      "confidence": 0.91,
+      "changes": [
+        {"from": "ngly", "to": "ngày", "reason": "Sửa ký tự nhầm dấu ngày"},
+        {"from": "thíng", "to": "tháng", "reason": "Sửa i thành á"},
+        {"from": "nim", "to": "năm", "reason": "Sửa i thành ă"}
+      ]
+    }
+  },
+  "vlm": {
+    "tang vt vi phąm hành chinh tjch thu sung quý nhà nuóc theo Công văn s: 20/CV-": {
+      "caseId": "GC3",
+      "transcription": "tang vật vi phạm hành chính tịch thu sung quỹ nhà nước theo Công văn số: 20/CV-QLTT",
+      "confidence": 0.92,
+      "uncertain": false,
+      "uncertainSpans": [],
+      "changes": [
+        {"from": "20/CV-", "to": "20/CV-QLTT", "reason": "Đọc phần đuôi QLTT bị cắt trên ảnh"}
+      ]
+    },
+    "Hài Phòng. ngày th tháng 01 năm 2021": {
+      "caseId": "GC4",
+      "transcription": "Hải Phòng, ngày 05 tháng 01 năm 2021",
+      "confidence": 0.90,
+      "uncertain": false,
+      "uncertainSpans": [],
+      "changes": [
+        {"from": "th", "to": "05", "reason": "Đọc chữ số 05 trên crop ảnh"}
+      ]
+    },
+    "ngly .. thíng 01 nim 2021": {
+      "caseId": "GC5",
+      "transcription": "ngày .. tháng 01 năm 2021",
+      "confidence": 0.62,
+      "uncertain": true,
+      "uncertainSpans": [".."],
+      "changes": []
+    },
+    "705/cPngey": {
+      "caseId": "GC7a",
+      "transcription": "705/CP-VP",
+      "confidence": 0.88,
+      "uncertain": false,
+      "uncertainSpans": [],
+      "changes": [
+        {"from": "705/cPngey", "to": "705/CP-VP", "reason": "Đọc số hiệu đầy đủ trên crop"}
+      ]
+    },
+    "Công văn 705/cPngey": {
+      "caseId": "GC7a_line",
+      "transcription": "Công văn 705/CP-VP",
+      "confidence": 0.88,
+      "uncertain": false,
+      "uncertainSpans": [],
+      "changes": [
+        {"from": "705/cPngey", "to": "705/CP-VP", "reason": "Đọc số hiệu đầy đủ trên crop"}
+      ]
+    },
+    "19/p": {
+      "caseId": "GC7b",
+      "transcription": "19/QĐ",
+      "confidence": 0.87,
+      "uncertain": false,
+      "uncertainSpans": [],
+      "changes": [
+        {"from": "19/p", "to": "19/QĐ", "reason": "Đọc hậu tố QĐ trên crop"}
+      ]
+    },
+    "Công văn 19/p": {
+      "caseId": "GC7b_line",
+      "transcription": "Công văn 19/QĐ",
+      "confidence": 0.87,
+      "uncertain": false,
+      "uncertainSpans": [],
+      "changes": [
+        {"from": "19/p", "to": "19/QĐ", "reason": "Đọc hậu tố QĐ trên crop"}
+      ]
+    },
+    "1027/": {
+      "caseId": "GC7c",
+      "transcription": "1027/QĐ-UBND",
+      "confidence": 0.89,
+      "uncertain": false,
+      "uncertainSpans": [],
+      "changes": [
+        {"from": "1027/", "to": "1027/QĐ-UBND", "reason": "Đọc phần đuôi QĐ-UBND trên crop"}
+      ]
+    },
+    "Số: 1027/": {
+      "caseId": "GC7c_line",
+      "transcription": "Số: 1027/QĐ-UBND",
+      "confidence": 0.89,
+      "uncertain": false,
+      "uncertainSpans": [],
+      "changes": [
+        {"from": "1027/", "to": "1027/QĐ-UBND", "reason": "Đọc phần đuôi QĐ-UBND trên crop"}
+      ]
+    }
+  }
+}
