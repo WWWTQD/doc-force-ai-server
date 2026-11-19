@@ -32,8 +32,11 @@ except ImportError:
 
 LOG = logging.getLogger("docforge.worker.gemini")
 
-DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
-FALLBACK_GEMINI_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
+FALLBACK_GEMINI_MODEL = (
+    "gemini-3.1-flash-lite,gemini-3.5-flash,gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash"
+)
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 28.0
 _UNSET = object()
 
 _TEXT_SYSTEM_PROMPT = """Bạn là chuyên gia hiệu đính văn bản OCR hành chính - pháp lý và sách/tài liệu lịch sử tiếng Việt.
@@ -283,7 +286,7 @@ class GeminiProvider:
 
         if fallback_on_unavailable is None:
             fallback_on_unavailable = (
-                os.getenv("LLM_FALLBACK_ON_UNAVAILABLE", "false").strip().lower() in ("1", "true", "yes", "on")
+                os.getenv("LLM_FALLBACK_ON_UNAVAILABLE", "true").strip().lower() in ("1", "true", "yes", "on")
             )
         self.fallback_on_unavailable = bool(fallback_on_unavailable)
 
@@ -292,9 +295,11 @@ class GeminiProvider:
 
         if request_timeout_seconds is None:
             try:
-                request_timeout_seconds = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "10.0"))
+                request_timeout_seconds = float(
+                    os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", str(DEFAULT_REQUEST_TIMEOUT_SECONDS))
+                )
             except ValueError:
-                request_timeout_seconds = 10.0
+                request_timeout_seconds = DEFAULT_REQUEST_TIMEOUT_SECONDS
         self.request_timeout_seconds = max(0.5, float(request_timeout_seconds))
 
         if cloud_consent is None:
@@ -440,6 +445,14 @@ class GeminiProvider:
             result,
         )
 
+    def _persist_model_override(self, kind: str, model_name: str) -> None:
+        self._controller.set_model_override(kind, model_name)
+        if kind == "text":
+            self.text_model_name = model_name
+            self.model_name = model_name
+        else:
+            self.vision_model_name = model_name
+
     def _invoke(
         self,
         *,
@@ -455,7 +468,12 @@ class GeminiProvider:
         deadline_ts: float,
     ) -> tuple[Any, LLMUsageLog]:
         t0 = self._clock()
-        active_model = self._controller.get_model_override(kind) or model
+        initial_model = self._controller.get_model_override(kind) or model
+        candidate_pool = list(dict.fromkeys([initial_model, *self._fallback_models, model]))
+        available_pool = [
+            cand for cand in candidate_pool if cand and not self._controller.is_model_unavailable(cand)
+        ]
+        active_model = available_pool[0] if available_pool else initial_model
 
         def _usage(
             *,
@@ -513,6 +531,13 @@ class GeminiProvider:
         if self._controller.is_breaker_open():
             return None, _usage(status="BREAKER_OPEN", rate_limited=True)
 
+        if not available_pool:
+            if self._controller.disable_provider("MODEL_UNAVAILABLE"):
+                LOG.warning(
+                    "Gemini model unavailable (all configured models returned 404); disabling provider for process."
+                )
+            return None, _usage(status="MODEL_UNAVAILABLE")
+
         cache_key = make_cache_key(
             model=active_model,
             prompt_version=PROMPT_VERSION,
@@ -533,13 +558,22 @@ class GeminiProvider:
         transient_retries = 0
         thinking_retried = False
         tried_models: set[str] = {active_model}
+        saw_transient_failure = False
+        last_transient_tag = "SERVER_ERROR"
+        persist_on_success = active_model != initial_model
 
-        def _try_fallback(reason: str, *, persistent: bool = False) -> tuple[bool, tuple[Any, LLMUsageLog] | None]:
-            nonlocal active_model, cache_key
+        def _try_fallback(
+            reason: str, *, persistent: bool = False
+        ) -> tuple[bool, tuple[Any, LLMUsageLog] | None]:
+            nonlocal active_model, cache_key, persist_on_success, thinking_retried
             fb = None
-            candidate_pool = list(dict.fromkeys([*self._fallback_models, model]))
-            for cand in candidate_pool:
-                if cand and cand not in tried_models:
+            pool = list(dict.fromkeys([*self._fallback_models, model]))
+            for cand in pool:
+                if (
+                    cand
+                    and cand not in tried_models
+                    and not self._controller.is_model_unavailable(cand)
+                ):
                     fb = cand
                     break
             if not fb:
@@ -553,14 +587,10 @@ class GeminiProvider:
                 persistent,
             )
             if persistent:
-                self._controller.set_model_override(kind, fb)
-                if kind == "text":
-                    self.text_model_name = fb
-                    self.model_name = fb
-                else:
-                    self.vision_model_name = fb
+                persist_on_success = True
             active_model = fb
             tried_models.add(fb)
+            thinking_retried = False
             cache_key = make_cache_key(
                 model=active_model,
                 prompt_version=PROMPT_VERSION,
@@ -569,6 +599,8 @@ class GeminiProvider:
             )
             cached_fb = self._cache.get(cache_key)
             if cached_fb is not None:
+                if persist_on_success:
+                    self._persist_model_override(kind, active_model)
                 return True, (cached_fb, _usage(status="ok", cache_hit=True, used_model=active_model))
             if (deadline_ts - self._clock()) > 0.5:
                 return True, None
@@ -613,6 +645,7 @@ class GeminiProvider:
                     return None, _usage(status="AUTH_ERROR")
 
                 if code == 404 or api_status == "NOT_FOUND":
+                    self._controller.mark_model_unavailable(active_model)
                     switched, early = _try_fallback(
                         f"code={code} status={api_status or 'NOT_FOUND'}",
                         persistent=True,
@@ -621,6 +654,15 @@ class GeminiProvider:
                         if early is not None:
                             return early
                         continue
+                    if saw_transient_failure:
+                        LOG.warning(
+                            "Gemini fallback chain exhausted (last model=%s code=%s); keeping provider active after transient errors.",
+                            active_model,
+                            code,
+                        )
+                        if (deadline_ts - self._clock()) <= 0 and last_transient_tag == "REQUEST_TIMEOUT":
+                            return None, _usage(status="timeout", error_reason="PAGE_DEADLINE_EXCEEDED")
+                        return None, _usage(status="FAILED_SAFE", error_reason=last_transient_tag)
                     if self._controller.disable_provider("MODEL_UNAVAILABLE"):
                         LOG.warning(
                             "Gemini model unavailable (model=%s code=%s status=%s); disabling provider for process.",
@@ -651,10 +693,12 @@ class GeminiProvider:
                     return None, _usage(status="FAILED_SAFE", error_reason="BAD_REQUEST")
 
                 if _is_timeout_exception(exc, code):
+                    saw_transient_failure = True
+                    last_transient_tag = "REQUEST_TIMEOUT"
                     if self.fallback_on_unavailable:
                         switched, early = _try_fallback(
                             f"status=TIMEOUT code={code}",
-                            persistent=(active_model == model),
+                            persistent=(active_model == initial_model),
                         )
                         if switched:
                             if early is not None:
@@ -671,10 +715,12 @@ class GeminiProvider:
                     return None, _usage(status="FAILED_SAFE", error_reason="REQUEST_TIMEOUT")
 
                 if (code is not None and 500 <= code < 600) or _is_transient_network_exception(exc):
+                    saw_transient_failure = True
+                    last_transient_tag = "SERVER_ERROR" if (code is not None and 500 <= code < 600) else "NETWORK_ERROR"
                     if self.fallback_on_unavailable:
                         switched, early = _try_fallback(
                             f"type={type(exc).__name__} code={code} status={api_status or 'TRANSIENT'}",
-                            persistent=(active_model == model),
+                            persistent=(active_model == initial_model),
                         )
                         if switched:
                             if early is not None:
@@ -684,9 +730,8 @@ class GeminiProvider:
                     if transient_retries == 0 and rem_after > 1.0:
                         transient_retries += 1
                         continue
-                    err_tag = "SERVER_ERROR" if (code is not None and 500 <= code < 600) else "NETWORK_ERROR"
                     LOG.warning("Gemini transient failure type=%s code=%s", type(exc).__name__, code)
-                    return None, _usage(status="FAILED_SAFE", error_reason=err_tag)
+                    return None, _usage(status="FAILED_SAFE", error_reason=last_transient_tag)
 
                 LOG.warning("Gemini unexpected failure type=%s", type(exc).__name__)
                 return None, _usage(status="FAILED_SAFE", error_reason=f"EXCEPTION:{type(exc).__name__}")
@@ -713,6 +758,9 @@ class GeminiProvider:
                     tokens_thought=tokens_thought,
                     error_reason=f"FINISH_REASON_{finish_reason}",
                 )
+
+            if persist_on_success:
+                self._persist_model_override(kind, active_model)
 
             raw_text = getattr(resp, "text", None)
             text_out = raw_text if isinstance(raw_text, str) else ""

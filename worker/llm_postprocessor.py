@@ -6,6 +6,7 @@ import copy
 import difflib
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -81,25 +82,34 @@ class PostprocessConfig:
     reocr_enabled: bool = False
     max_reocr_lines_per_page: int = 15
     allow_common_loanwords: bool = True
-    page_deadline_seconds: float = 15.0
+    page_deadline_seconds: float = 90.0
     max_vlm_crops: int = 0
-    text_model: str = "gemini-3.5-flash"
-    vision_model: str = "gemini-3.5-flash"
-    fallback_model: str | None = "gemini-3.5-flash-lite"
-    fallback_on_unavailable: bool = False
+    text_model: str = "gemini-3.5-flash-lite"
+    vision_model: str = "gemini-3.5-flash-lite"
+    fallback_model: str | None = (
+        "gemini-3.1-flash-lite,gemini-3.5-flash,gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash"
+    )
+    fallback_on_unavailable: bool = True
     thinking_level: str = "minimal"
     rpm_limit: int = 5
     daily_request_budget: int = 150
     cloud_consent: bool = False
     cloud_tier: str = "free"
-    request_timeout_seconds: float = 10.0
+    request_timeout_seconds: float = 28.0
+    chunk_trigger_lines: int = 8
+    chunk_trigger_chars: int = 900
+    chunk_max_lines: int = 7
+    chunk_max_chars: int = 1400
 
     @classmethod
     def from_env(cls) -> PostprocessConfig:
-        default_model = os.getenv("LLM_MODEL", "gemini-3.5-flash").strip() or "gemini-3.5-flash"
+        default_model = os.getenv("LLM_MODEL", "gemini-3.5-flash-lite").strip() or "gemini-3.5-flash-lite"
         text_model = os.getenv("LLM_TEXT_MODEL", default_model).strip() or default_model
         vision_model = os.getenv("LLM_VISION_MODEL", os.getenv("LLM_TEXT_MODEL", default_model)).strip() or default_model
-        raw_fb = os.getenv("LLM_FALLBACK_MODEL", "gemini-3.5-flash-lite").strip()
+        raw_fb = os.getenv(
+            "LLM_FALLBACK_MODEL",
+            "gemini-3.1-flash-lite,gemini-3.5-flash,gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash",
+        ).strip()
         tier = os.getenv("LLM_CLOUD_TIER", "free").strip().lower()
         return cls(
             enabled=_env_bool(
@@ -114,18 +124,22 @@ class PostprocessConfig:
             reocr_enabled=_env_bool("LLM_REOCR_ENABLED", False),
             max_reocr_lines_per_page=max(0, _env_int("MAX_REOCR_LINES_PER_PAGE", 15)),
             allow_common_loanwords=_env_bool("ALLOW_COMMON_LOANWORDS", True),
-            page_deadline_seconds=max(0.1, _env_float("LLM_PAGE_DEADLINE_SECONDS", 15.0)),
+            page_deadline_seconds=max(0.1, _env_float("LLM_PAGE_DEADLINE_SECONDS", 90.0)),
             max_vlm_crops=max(0, _env_int("LLM_MAX_VLM_CROPS", 0)),
             text_model=text_model,
             vision_model=vision_model,
             fallback_model=raw_fb or None,
-            fallback_on_unavailable=_env_bool("LLM_FALLBACK_ON_UNAVAILABLE", False),
+            fallback_on_unavailable=_env_bool("LLM_FALLBACK_ON_UNAVAILABLE", True),
             thinking_level=os.getenv("LLM_THINKING_LEVEL", "minimal").strip().lower() or "minimal",
             rpm_limit=_env_int("LLM_RPM_LIMIT", 5),
             daily_request_budget=max(0, _env_int("LLM_DAILY_REQUEST_BUDGET", 150)),
             cloud_consent=_env_bool("LLM_CLOUD_CONSENT", False),
             cloud_tier=tier if tier in ("free", "paid") else "free",
-            request_timeout_seconds=max(0.5, _env_float("LLM_REQUEST_TIMEOUT_SECONDS", 10.0)),
+            request_timeout_seconds=max(0.5, _env_float("LLM_REQUEST_TIMEOUT_SECONDS", 28.0)),
+            chunk_trigger_lines=max(1, _env_int("LLM_CHUNK_TRIGGER_LINES", 8)),
+            chunk_trigger_chars=max(1, _env_int("LLM_CHUNK_TRIGGER_CHARS", 900)),
+            chunk_max_lines=max(1, _env_int("LLM_CHUNK_MAX_LINES", 7)),
+            chunk_max_chars=max(1, _env_int("LLM_CHUNK_MAX_CHARS", 1400)),
         )
 
 
@@ -292,6 +306,77 @@ def _attach_reasons(ops: list[dict[str, Any]], llm_changes: list[dict[str, Any]]
             item["reason"] = matched
         enriched.append(item)
     return enriched
+
+
+def _partition_candidate_chunks(
+    candidate_indices: list[int],
+    lengths_by_idx: dict[int, int],
+    *,
+    trigger_lines: int = 8,
+    trigger_chars: int = 900,
+    target_lines_per_chunk: int = 7,
+    target_chars_per_chunk: int = 1400,
+) -> list[list[int]]:
+    """Split candidate indices into balanced 6-8 line chunks when a page is long or text-heavy."""
+    n = len(candidate_indices)
+    if n <= 0:
+        return []
+    if n == 1:
+        return [candidate_indices]
+    total_chars = sum(lengths_by_idx.get(idx, 0) for idx in candidate_indices)
+    if n <= trigger_lines and total_chars <= trigger_chars:
+        return [candidate_indices]
+
+    chunks_by_lines = math.ceil(n / max(1, target_lines_per_chunk))
+    chunks_by_chars = (
+        math.ceil(total_chars / max(1, target_chars_per_chunk))
+        if total_chars > trigger_chars
+        else 1
+    )
+    num_chunks = min(n, max(2, chunks_by_lines, chunks_by_chars))
+    base, rem = divmod(n, num_chunks)
+    chunks: list[list[int]] = []
+    cursor = 0
+    for k in range(num_chunks):
+        size = base + (1 if k < rem else 0)
+        chunks.append(candidate_indices[cursor : cursor + size])
+        cursor += size
+    return chunks
+
+
+def _normalize_auto_apply_batch(
+    parsed_resp: Any,
+    expected_ids: list[str],
+    locked_state: dict[str, tuple[dict[str, Any], str, str, list[LockedToken]]],
+) -> Any:
+    if not (isinstance(parsed_resp, dict) and isinstance(parsed_resp.get("lines"), list)):
+        return parsed_resp
+    expected_set = set(expected_ids)
+    norm_lines: list[dict[str, Any]] = []
+    seen_lids: set[str] = set()
+    for raw_it in parsed_resp["lines"]:
+        if not isinstance(raw_it, dict):
+            continue
+        lid = raw_it.get("lineId")
+        if not isinstance(lid, str) or lid not in expected_set or lid in seen_lids:
+            continue
+        seen_lids.add(lid)
+        corr_val = raw_it.get("corrected")
+        if isinstance(corr_val, str) and ("\n" in corr_val or "\r" in corr_val):
+            raw_it = {**raw_it, "corrected": " ".join(corr_val.splitlines()).strip()}
+        norm_lines.append(raw_it)
+    if seen_lids and len(seen_lids) < len(expected_ids):
+        for lid in expected_ids:
+            if lid not in seen_lids and lid in locked_state:
+                norm_lines.append(
+                    {
+                        "lineId": lid,
+                        "corrected": locked_state[lid][2],
+                        "confidence": 1.0,
+                        "changes": [],
+                    }
+                )
+    return {**parsed_resp, "lines": norm_lines}
 
 
 def _validate_vlm_batch(
@@ -622,9 +707,10 @@ def process_page(
                 send_indices.add(eligible_indices[pos + 1])
 
         page_counter = PageTokenCounter()
-        payload_lines: list[dict[str, Any]] = []
+        locked_entries: dict[int, dict[str, Any]] = {}
         locked_state: dict[str, tuple[dict[str, Any], str, str, list[LockedToken]]] = {}
-        expected_candidate_ids: list[str] = []
+        expected_candidate_indices: list[int] = []
+        cand_lengths: dict[int, int] = {}
 
         for idx in sorted(send_indices):
             blk = blocks[idx]
@@ -634,22 +720,22 @@ def process_page(
             line_id = str(blk.get("id") or f"line-{idx}")
             is_cand = idx in selected_indices
             locked_txt, locked_toks = TokenLocker.lock(raw_txt, page_counter)
-            entry: dict[str, Any] = {
+            reocr_locked: str | None = None
+            if is_cand:
+                if line_id in reocr_texts and not has_placeholder_collision(reocr_texts[line_id]):
+                    reocr_locked, _ = TokenLocker.lock(reocr_texts[line_id], page_counter)
+                locked_state[line_id] = (blk, raw_txt, locked_txt, locked_toks)
+                expected_candidate_indices.append(idx)
+                cand_lengths[idx] = len(locked_txt)
+            locked_entries[idx] = {
                 "lineId": line_id,
                 "order": blk.get("order", idx + 1),
-                "isCandidate": is_cand,
                 "text": locked_txt,
+                "invalidSyllables": cand_by_idx[idx]["inv_tokens"] if is_cand else [],
+                "reocrText": reocr_locked,
             }
-            if is_cand:
-                entry["invalidSyllables"] = cand_by_idx[idx]["inv_tokens"]
-                if line_id in reocr_texts and not has_placeholder_collision(reocr_texts[line_id]):
-                    re_locked, _ = TokenLocker.lock(reocr_texts[line_id], page_counter)
-                    entry["reocrText"] = re_locked
-                locked_state[line_id] = (blk, raw_txt, locked_txt, locked_toks)
-                expected_candidate_ids.append(line_id)
-            payload_lines.append(entry)
 
-        if not expected_candidate_ids:
+        if not expected_candidate_indices:
             out_layout["postprocessMeta"] = _build_meta("COMPLETED")
             return out_layout
 
@@ -658,84 +744,128 @@ def process_page(
             out_layout["postprocessMeta"] = _build_meta("TIMEOUT", "PAGE_DEADLINE_EXCEEDED")
             return out_layout
 
-        page_payload = {
-            "pageNumber": out_layout.get("pageNumber", 1),
-            "lines": payload_lines,
-        }
-        raw_llm_resp, llm_usage = client.correct_lines_batch(
-            page_payload, local_only=local_only, deadline_ts=deadline_ts
+        chunks = _partition_candidate_chunks(
+            expected_candidate_indices,
+            cand_lengths,
+            trigger_lines=cfg.chunk_trigger_lines,
+            trigger_chars=cfg.chunk_trigger_chars,
+            target_lines_per_chunk=cfg.chunk_max_lines,
+            target_chars_per_chunk=cfg.chunk_max_chars,
         )
-        if getattr(llm_usage, "model", None):
-            llm_model = str(llm_usage.model)
-        _accumulate_usage(llm_usage)
-        if llm_usage.status not in (
-            "CLOUD_NOT_CONSENTED",
-            "LOCAL_ENDPOINT_UNAVAILABLE",
-            "BREAKER_OPEN",
-            "DAILY_BUDGET_EXHAUSTED",
-        ):
-            llm_calls += 1
-
-        if llm_usage.status in _SKIP_USAGE_STATUSES:
-            out_layout["postprocessMeta"] = _build_meta("SKIPPED", llm_usage.status)
-            return out_layout
-
-        if llm_usage.status == "timeout" or time.monotonic() >= deadline_ts:
-            out_layout["postprocessMeta"] = _build_meta("TIMEOUT", "PAGE_DEADLINE_EXCEEDED")
-            return out_layout
-
-        if llm_usage.status == "FAILED_SAFE":
-            out_layout["postprocessMeta"] = _build_meta(
-                "FAILED_SAFE",
-                getattr(llm_usage, "error_reason", None) or "FAILED_SAFE",
-                suggestions_override=0,
+        if len(chunks) > 1:
+            LOG.info(
+                "  -> Chia %d blocks cần sửa thành %d cụm nhỏ (%s dòng/cụm) để tránh timeout.",
+                len(expected_candidate_indices),
+                len(chunks),
+                "/".join(str(len(ch)) for ch in chunks),
             )
-            return out_layout
-
-        parsed_resp: Any = raw_llm_resp
-        if isinstance(raw_llm_resp, str):
-            try:
-                parsed_resp = json.loads(raw_llm_resp)
-            except json.JSONDecodeError:
-                parsed_resp = None
-
-        if auto_apply and isinstance(parsed_resp, dict) and isinstance(parsed_resp.get("lines"), list):
-            expected_set = set(expected_candidate_ids)
-            norm_lines: list[dict[str, Any]] = []
-            seen_lids: set[str] = set()
-            for raw_it in parsed_resp["lines"]:
-                if not isinstance(raw_it, dict):
-                    continue
-                lid = raw_it.get("lineId")
-                if not isinstance(lid, str) or lid not in expected_set or lid in seen_lids:
-                    continue
-                seen_lids.add(lid)
-                corr_val = raw_it.get("corrected")
-                if isinstance(corr_val, str) and ("\n" in corr_val or "\r" in corr_val):
-                    raw_it = {**raw_it, "corrected": " ".join(corr_val.splitlines()).strip()}
-                norm_lines.append(raw_it)
-            if seen_lids and len(seen_lids) < len(expected_candidate_ids):
-                for lid in expected_candidate_ids:
-                    if lid not in seen_lids and lid in locked_state:
-                        norm_lines.append(
-                            {
-                                "lineId": lid,
-                                "corrected": locked_state[lid][2],
-                                "confidence": 1.0,
-                                "changes": [],
-                            }
-                        )
-            parsed_resp = {**parsed_resp, "lines": norm_lines}
 
         llm_accepted: dict[str, dict[str, Any]] = {}
-        ok_page, page_err, parsed_by_id = TokenGuard.validate_page_batch(
-            parsed_resp, expected_candidate_ids
-        )
-        if not ok_page:
-            if page_err is not None:
-                _inc_rejection(rejections, page_err)
-        else:
-            for line_id in expected_candidate_ids:
+        successful_chunks = 0
+        last_ok_model: str | None = None
+        last_seen_model: str | None = None
+        last_skip_reason: str | None = None
+        saw_timeout = False
+        saw_failed_safe = False
+        last_fail_reason: str | None = None
+
+        for chunk_idx, chunk_cand_indices in enumerate(chunks, start=1):
+            if time.monotonic() >= deadline_ts:
+                saw_timeout = True
+                break
+
+            chunk_cand_set = set(chunk_cand_indices)
+            chunk_send_indices: set[int] = set(chunk_cand_indices)
+            for c_idx in chunk_cand_indices:
+                pos = pos_of_idx[c_idx]
+                if pos - 1 >= 0:
+                    chunk_send_indices.add(eligible_indices[pos - 1])
+                if pos + 1 < len(eligible_indices):
+                    chunk_send_indices.add(eligible_indices[pos + 1])
+
+            chunk_payload_lines: list[dict[str, Any]] = []
+            chunk_candidate_ids: list[str] = []
+            for s_idx in sorted(chunk_send_indices):
+                info = locked_entries.get(s_idx)
+                if info is None:
+                    continue
+                is_chunk_cand = s_idx in chunk_cand_set
+                entry: dict[str, Any] = {
+                    "lineId": info["lineId"],
+                    "order": info["order"],
+                    "isCandidate": is_chunk_cand,
+                    "text": info["text"],
+                }
+                if is_chunk_cand:
+                    entry["invalidSyllables"] = info["invalidSyllables"]
+                    if info["reocrText"] is not None:
+                        entry["reocrText"] = info["reocrText"]
+                    chunk_candidate_ids.append(info["lineId"])
+                chunk_payload_lines.append(entry)
+
+            if not chunk_candidate_ids:
+                continue
+
+            page_payload = {
+                "pageNumber": out_layout.get("pageNumber", 1),
+                "lines": chunk_payload_lines,
+            }
+            raw_llm_resp, llm_usage = client.correct_lines_batch(
+                page_payload, local_only=local_only, deadline_ts=deadline_ts
+            )
+            if getattr(llm_usage, "model", None):
+                last_seen_model = str(llm_usage.model)
+            _accumulate_usage(llm_usage)
+            if llm_usage.status not in (
+                "CLOUD_NOT_CONSENTED",
+                "LOCAL_ENDPOINT_UNAVAILABLE",
+                "BREAKER_OPEN",
+                "DAILY_BUDGET_EXHAUSTED",
+            ):
+                llm_calls += 1
+
+            if llm_usage.status in _SKIP_USAGE_STATUSES:
+                last_skip_reason = llm_usage.status
+                break
+
+            if llm_usage.status == "timeout" or time.monotonic() >= deadline_ts:
+                saw_timeout = True
+                if time.monotonic() >= deadline_ts or len(chunks) == 1:
+                    break
+                continue
+
+            if llm_usage.status == "FAILED_SAFE":
+                saw_failed_safe = True
+                last_fail_reason = getattr(llm_usage, "error_reason", None) or "FAILED_SAFE"
+                if (deadline_ts - time.monotonic()) <= 1.0:
+                    break
+                continue
+
+            if getattr(llm_usage, "model", None):
+                last_ok_model = str(llm_usage.model)
+
+            parsed_resp: Any = raw_llm_resp
+            if isinstance(raw_llm_resp, str):
+                try:
+                    parsed_resp = json.loads(raw_llm_resp)
+                except json.JSONDecodeError:
+                    parsed_resp = None
+
+            if auto_apply:
+                parsed_resp = _normalize_auto_apply_batch(
+                    parsed_resp, chunk_candidate_ids, locked_state
+                )
+
+            ok_page, page_err, parsed_by_id = TokenGuard.validate_page_batch(
+                parsed_resp, chunk_candidate_ids
+            )
+            successful_chunks += 1
+            if not ok_page:
+                if page_err is not None:
+                    _inc_rejection(rejections, page_err)
+                continue
+
+            for line_id in chunk_candidate_ids:
                 blk, raw_txt, locked_txt, locked_toks = locked_state[line_id]
                 item = parsed_by_id[line_id]
                 guard_res = TokenGuard.check_line(
@@ -759,6 +889,35 @@ def process_page(
                     "ops": ops,
                     "risk": guard_res.risk,
                 }
+
+        if last_ok_model:
+            llm_model = last_ok_model
+        elif last_seen_model:
+            llm_model = last_seen_model
+
+        had_chunk_failure = bool(last_skip_reason or saw_timeout or saw_failed_safe)
+        if successful_chunks == 0 or (had_chunk_failure and not llm_accepted):
+            if last_skip_reason is not None:
+                out_layout["postprocessMeta"] = _build_meta("SKIPPED", last_skip_reason)
+                return out_layout
+            if saw_timeout:
+                out_layout["postprocessMeta"] = _build_meta("TIMEOUT", "PAGE_DEADLINE_EXCEEDED")
+                return out_layout
+            if saw_failed_safe:
+                out_layout["postprocessMeta"] = _build_meta(
+                    "FAILED_SAFE",
+                    last_fail_reason or "FAILED_SAFE",
+                    suggestions_override=0,
+                )
+                return out_layout
+
+        partial_chunk_skip_reason: str | None = None
+        if had_chunk_failure and llm_accepted:
+            fail_detail = (
+                last_skip_reason
+                or ("PAGE_DEADLINE_EXCEEDED" if saw_timeout else (last_fail_reason or "FAILED_SAFE"))
+            )
+            partial_chunk_skip_reason = f"PARTIAL_CHUNK_FAILURE:{fail_detail}"
 
         # Path L3: Batched VLM verification (<=1 request, <=5 crops) ONLY for damaged protected tokens (C7)
         damaged_candidates = [c for c in selected if c["damaged_tokens"]]
@@ -943,7 +1102,7 @@ def process_page(
         final_skip = (
             "VLM_SKIPPED_PII_REDACTION"
             if (damaged_candidates and vlm_skipped_due_to_pii)
-            else vlm_skip_reason
+            else (vlm_skip_reason or partial_chunk_skip_reason)
         )
         out_layout["postprocessMeta"] = _build_meta("COMPLETED", final_skip)
         return out_layout

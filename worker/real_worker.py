@@ -556,350 +556,37 @@ def _process_export_job(job: dict):
         heartbeat.join(timeout=5)
 
 
-def _strip_markdown_tokens(text: str) -> str:
-    """Loại bỏ các cặp ký hiệu markdown (**bold**, *italic*, <u>underline</u>, __underline__) để lấy chuỗi thuần."""
-    import re
-    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
-    s = re.sub(r"\*([^*]+)\*", r"\1", s)
-    s = re.sub(r"<u>(.*?)</u>", r"\1", s)
-    s = re.sub(r"__([^_]+)__", r"\1", s)
-    return s.strip()
-
-
-def _resolve_ttf_font(filename: str, fallback_names: list[str]):
-    """Tìm đường dẫn file font TrueType hỗ trợ đầy đủ tiếng Việt Unicode."""
-    candidates = [
-        os.path.join(PROJECT_ROOT, "models", "fonts", filename),
-        os.path.join(WORKER_DIR, "models", "fonts", filename),
-        os.path.join("/app", "models", "fonts", filename),
-        os.path.join(r"C:\Windows\Fonts", filename),
-    ]
-    for fn in fallback_names:
-        candidates.append(os.path.join("/usr/share/fonts/truetype/dejavu", fn))
-        candidates.append(os.path.join("/usr/share/fonts/truetype/liberation", fn))
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    return None
+try:
+    from export_layout import (
+        append_formatted_runs as _append_formatted_runs,
+        generate_docx_from_snapshot as _export_generate_docx_from_snapshot,
+        generate_pdf_from_snapshot as _export_generate_pdf_from_snapshot,
+        resolve_ttf_font as _resolve_ttf_font,
+        strip_markdown_tokens as _strip_markdown_tokens,
+    )
+except ImportError:
+    from worker.export_layout import (
+        append_formatted_runs as _append_formatted_runs,
+        generate_docx_from_snapshot as _export_generate_docx_from_snapshot,
+        generate_pdf_from_snapshot as _export_generate_pdf_from_snapshot,
+        resolve_ttf_font as _resolve_ttf_font,
+        strip_markdown_tokens as _strip_markdown_tokens,
+    )
 
 
 def _generate_pdf_from_snapshot(snapshot: dict) -> bytes:
     """
-    Tái tạo file PDF (.pdf) nhiều trang chuẩn khổ A4 (200 DPI: 1654 x 2339 px) nền trắng tinh khiết,
-    giữ nguyên chữ hoa, kiểu chữ (Đậm/Nghiêng/Gạch chân), căn lề (Giữa/Phải/Đều 2 bên/Trái) và thụt đầu dòng.
+    Tái tạo file PDF (.pdf) nhiều trang chuẩn khổ A4 (200 DPI: 1654 x 2339 px),
+    giữ đúng hàng nhiều cột (Quốc hiệu 2 bên / biểu mẫu), khối chữ ký nửa phải và bảng biểu.
     """
-    from PIL import Image, ImageDraw, ImageFont
-
-    a4_w, a4_h = 1654, 2339  # A4 @ 200 DPI
-    margin_left = 195        # ~2.5 cm
-    margin_right = 140       # ~1.8 cm
-    margin_top = 150         # ~2.0 cm
-    margin_bottom = 150      # ~2.0 cm
-    content_w = a4_w - margin_left - margin_right
-
-    reg_path = _resolve_ttf_font("times.ttf", ["DejaVuSerif.ttf", "LiberationSerif-Regular.ttf"])
-    bold_path = _resolve_ttf_font("timesbd.ttf", ["DejaVuSerif-Bold.ttf", "LiberationSerif-Bold.ttf"])
-    ital_path = _resolve_ttf_font("timesi.ttf", ["DejaVuSerif-Italic.ttf", "LiberationSerif-Italic.ttf"])
-    bi_path = _resolve_ttf_font("timesbi.ttf", ["DejaVuSerif-BoldItalic.ttf", "LiberationSerif-BoldItalic.ttf"])
-
-    def _get_font(is_b: bool, is_i: bool, size_px: int):
-        path = bi_path if (is_b and is_i) else (bold_path if is_b else (ital_path if is_i else reg_path))
-        if path:
-            try:
-                return ImageFont.truetype(path, size_px)
-            except Exception:
-                pass
-        return ImageFont.load_default()
-
-    pdf_pages: list[Image.Image] = []
-
-    raw_pages = snapshot.get("pages", [])
-    if not raw_pages:
-        raw_pages = [{"layout": {"blocks": []}}]
-
-    for page in raw_pages:
-        canvas = Image.new("RGB", (a4_w, a4_h), (255, 255, 255))
-        draw = ImageDraw.Draw(canvas)
-        curr_y = margin_top
-
-        layout = page.get("layout", {}) or {}
-        blocks = list(layout.get("blocks", []) or [])
-        blocks.sort(key=lambda b: b.get("order", 0))
-
-        for block in blocks:
-            b_type = str(block.get("type", "paragraph")).lower()
-            raw_text = (block.get("text") or "").strip()
-            if not raw_text:
-                continue
-
-            style_meta = block.get("style", {}) or {}
-            is_heading = "heading" in b_type or b_type == "title"
-            is_bold = bool(style_meta.get("bold", False) or is_heading or ("**" in raw_text))
-            is_italic = bool(style_meta.get("italic", False) or (raw_text.startswith("*") and raw_text.endswith("*")))
-            is_underline = bool(style_meta.get("underline", False) or ("<u>" in raw_text) or ("__" in raw_text))
-
-            clean_text = _strip_markdown_tokens(raw_text)
-            if is_heading and clean_text.isupper():
-                clean_text = clean_text.upper()
-
-            size_pt = float(style_meta.get("fontSizePt", 14.0 if is_heading else 13.0))
-            size_px = int(round(max(11.0, min(18.0, size_pt)) * (200.0 / 72.0)))
-            fnt = _get_font(is_bold, is_italic, size_px)
-
-            align = str(style_meta.get("textAlign", "center" if is_heading else "justify")).lower()
-            if "nhà xuất bản" in clean_text.lower():
-                align = "right"
-            is_indented = bool(style_meta.get("isIndented", False)) and align not in ("center", "right")
-
-            if is_heading:
-                curr_y += 10
-
-            # Ngắt dòng theo chiều rộng trang A4
-            words = clean_text.split()
-            if not words:
-                continue
-
-            wrapped_lines: list[tuple[list[str], int, bool]] = []
-            curr_words: list[str] = []
-            first_line = True
-
-            for w in words:
-                indent_offset = 70 if (first_line and is_indented) else 0
-                avail_w = content_w - indent_offset
-                test_str = " ".join(curr_words + [w])
-                tb = draw.textbbox((0, 0), test_str, font=fnt)
-                tw = tb[2] - tb[0]
-                if tw <= avail_w or not curr_words:
-                    curr_words.append(w)
-                else:
-                    wrapped_lines.append((curr_words, indent_offset, False))
-                    curr_words = [w]
-                    first_line = False
-            if curr_words:
-                indent_offset = 70 if (first_line and is_indented) else 0
-                wrapped_lines.append((curr_words, indent_offset, True))
-
-            for line_words, indent_px, is_last_line in wrapped_lines:
-                line_str = " ".join(line_words)
-                tb = draw.textbbox((0, 0), line_str, font=fnt)
-                tw = tb[2] - tb[0]
-                th = max(size_px, tb[3] - tb[1])
-
-                if curr_y + th > a4_h - margin_bottom:
-                    pdf_pages.append(canvas)
-                    canvas = Image.new("RGB", (a4_w, a4_h), (255, 255, 255))
-                    draw = ImageDraw.Draw(canvas)
-                    curr_y = margin_top
-
-                if align == "center":
-                    draw_x = (a4_w - tw) // 2
-                    draw.text((draw_x, curr_y), line_str, fill=(15, 16, 20), font=fnt)
-                    if is_underline:
-                        draw.line([(draw_x, curr_y + th + 3), (draw_x + tw, curr_y + th + 3)], fill=(15, 16, 20), width=2)
-                elif align == "right":
-                    draw_x = a4_w - margin_right - tw
-                    draw.text((draw_x, curr_y), line_str, fill=(15, 16, 20), font=fnt)
-                    if is_underline:
-                        draw.line([(draw_x, curr_y + th + 3), (draw_x + tw, curr_y + th + 3)], fill=(15, 16, 20), width=2)
-                elif align == "justify" and not is_last_line and len(line_words) > 2 and tw >= (content_w - indent_px) * 0.72:
-                    # Căn đều 2 bên (Justify) bằng cách phân bổ khoảng trắng giữa các từ
-                    word_widths = []
-                    for w_item in line_words:
-                        wb = draw.textbbox((0, 0), w_item, font=fnt)
-                        word_widths.append(wb[2] - wb[0])
-                    total_words_w = sum(word_widths)
-                    avail_line_w = content_w - indent_px
-                    gap = (avail_line_w - total_words_w) / float(len(line_words) - 1)
-                    cur_x = float(margin_left + indent_px)
-                    for w_item, ww in zip(line_words, word_widths):
-                        draw.text((int(round(cur_x)), curr_y), w_item, fill=(15, 16, 20), font=fnt)
-                        cur_x += ww + gap
-                else:
-                    draw_x = margin_left + indent_px
-                    draw.text((draw_x, curr_y), line_str, fill=(15, 16, 20), font=fnt)
-                    if is_underline:
-                        draw.line([(draw_x, curr_y + th + 3), (draw_x + tw, curr_y + th + 3)], fill=(15, 16, 20), width=2)
-
-                curr_y += int(round(size_px * 1.38))
-
-            curr_y += 6
-
-        pdf_pages.append(canvas)
-
-    buf = io.BytesIO()
-    pdf_pages[0].save(
-        buf,
-        format="PDF",
-        resolution=200.0,
-        save_all=True,
-        append_images=pdf_pages[1:],
-    )
-    return buf.getvalue()
-
-
-def _append_formatted_runs(p, text: str, style_meta: dict):
-    """Phân tách chuỗi markdown (**bold**, *italic*, <u>underline</u>) thành các runs trong docx."""
-    import re
-    block_bold = bool(style_meta.get("bold", False))
-    block_italic = bool(style_meta.get("italic", False))
-    block_underline = bool(style_meta.get("underline", False))
-    font_family = str(style_meta.get("fontFamily") or "Times New Roman")
-    font_size_pt = float(style_meta.get("fontSizePt") or 13.0)
-    font_size_pt = max(11.0, min(18.0, font_size_pt))
-
-    tokens = re.split(r'(\*\*[^*]+\*\*|\*[^*]+\*|<u>.*?</u>|__[^_]+__)', text)
-    for token in tokens:
-        if not token:
-            continue
-        is_b = block_bold
-        is_i = block_italic
-        is_u = block_underline
-        clean_text = token
-
-        if token.startswith("**") and token.endswith("**") and len(token) >= 4:
-            is_b = True
-            clean_text = token[2:-2]
-        elif token.startswith("*") and token.endswith("*") and len(token) >= 2:
-            is_i = True
-            clean_text = token[1:-1]
-        elif token.startswith("<u>") and token.endswith("</u>") and len(token) >= 7:
-            is_u = True
-            clean_text = token[3:-4]
-        elif token.startswith("__") and token.endswith("__") and len(token) >= 4:
-            is_u = True
-            clean_text = token[2:-2]
-
-        run = p.add_run(clean_text)
-        run.font.name = font_family
-        run.font.size = Pt(font_size_pt)
-        run.font.color.rgb = RGBColor(15, 16, 20)
-        if is_b:
-            run.bold = True
-        if is_i:
-            run.italic = True
-        if is_u:
-            run.underline = True
+    return _export_generate_pdf_from_snapshot(snapshot)
 
 
 def _generate_docx_from_snapshot(snapshot: dict) -> bytes:
-    """Tái tạo văn bản Word .docx từ snapshot JSON các trang với chuẩn định dạng sách/văn bản."""
+    """Tái tạo văn bản Word .docx từ snapshot JSON, giữ đúng hàng nhiều cột & chữ ký nửa phải."""
     if not DOCX_AVAILABLE:
         raise RuntimeError("python-docx chưa được cài đặt. Hãy chạy: pip install python-docx")
-
-    doc = docx.Document()
-
-    # Cấu hình khổ A4 & lề trang chuẩn Nghị định 30/2020/NĐ-CP (Top 2cm, Bottom 2cm, Left 2.8cm, Right 2cm)
-    sections = doc.sections
-    for section in sections:
-        section.page_width = Inches(8.27)
-        section.page_height = Inches(11.69)
-        section.top_margin = Inches(0.79)     # 2.0 cm
-        section.bottom_margin = Inches(0.79)  # 2.0 cm
-        section.left_margin = Inches(1.10)    # 2.8 cm
-        section.right_margin = Inches(0.79)   # 2.0 cm
-
-    # Cấu hình Style Normal mặc định: font Times New Roman, 13pt
-    style = doc.styles['Normal']
-    font = style.font
-    font.name = 'Times New Roman'
-    font.size = Pt(13)
-    font.color.rgb = RGBColor(15, 16, 20)
-
-    pages = snapshot.get("pages", [])
-    for p_idx, page in enumerate(pages):
-        if p_idx > 0:
-            doc.add_page_break()
-
-        layout = page.get("layout", {})
-        blocks = list(layout.get("blocks", []) or [])
-
-        # Sắp xếp blocks theo order
-        blocks.sort(key=lambda b: b.get("order", 0))
-
-        for block in blocks:
-            b_type = str(block.get("type", "paragraph")).lower()
-            text = (block.get("text") or "").strip()
-            if not text:
-                continue
-
-            style_meta = dict(block.get("style", {}) or {})
-
-            if "heading" in b_type or b_type == "title":
-                p = doc.add_paragraph()
-                h_align = str(style_meta.get("textAlign", "center")).lower()
-                if h_align == "left":
-                    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                elif h_align == "right":
-                    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-                else:
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                p.paragraph_format.space_before = Pt(8)
-                p.paragraph_format.space_after = Pt(6)
-                p.paragraph_format.line_spacing = 1.2
-                style_meta["bold"] = True
-                style_meta["fontSizePt"] = style_meta.get("fontSizePt", 14.5)
-                _append_formatted_runs(p, text, style_meta)
-            elif "table" in b_type:
-                table_data = block.get("tableData")
-                if isinstance(table_data, dict) and table_data.get("headers"):
-                    headers = table_data.get("headers", [])
-                    rows = table_data.get("rows", [])
-                    tbl = doc.add_table(rows=1 + len(rows), cols=len(headers))
-                    try:
-                        tbl.style = "Table Grid"
-                    except Exception:
-                        pass
-                    tbl_font_name = style_meta.get("fontFamily", "Times New Roman")
-                    tbl_font_pt = float(style_meta.get("fontSizePt", 12.0))
-                    for c_i, h_text in enumerate(headers):
-                        cell_p = tbl.rows[0].cells[c_i].paragraphs[0]
-                        cell_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                        run = cell_p.add_run(_strip_markdown_tokens(str(h_text)))
-                        run.bold = True
-                        run.font.name = tbl_font_name
-                        run.font.size = Pt(tbl_font_pt)
-                    for r_i, row_cells in enumerate(rows):
-                        for c_i, cell_val in enumerate(row_cells[:len(headers)]):
-                            cell_p = tbl.rows[r_i + 1].cells[c_i].paragraphs[0]
-                            _append_formatted_runs(
-                                cell_p,
-                                str(cell_val),
-                                {"fontFamily": tbl_font_name, "fontSizePt": tbl_font_pt, "bold": False},
-                            )
-                else:
-                    p = doc.add_paragraph()
-                    run = p.add_run(f"[BẢNG]: {text}")
-                    run.font.name = 'Times New Roman'
-                    run.font.size = Pt(12)
-                    run.bold = True
-                    p.paragraph_format.space_after = Pt(6)
-            elif "list" in b_type:
-                doc.add_paragraph(_strip_markdown_tokens(text), style="List Bullet")
-            else:
-                p = doc.add_paragraph()
-                p.paragraph_format.space_before = Pt(1)
-                p.paragraph_format.space_after = Pt(3)
-                p.paragraph_format.line_spacing = 1.20
-
-                align_str = str(style_meta.get("textAlign", "")).lower()
-                is_centered = align_str == "center"
-                is_right = align_str == "right" or "NHÀ XUẤT BẢN" in text.upper()
-                is_indented = bool(style_meta.get("isIndented", False))
-
-                if is_centered:
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                elif is_right:
-                    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-                else:
-                    p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                    if is_indented or (block.get("order", 0) > 1 and len(text) > 45 and not is_right):
-                        p.paragraph_format.first_line_indent = Pt(28)
-
-                _append_formatted_runs(p, text, style_meta)
-
-    buffer = io.BytesIO()
-    doc.save(buffer)
-    return buffer.getvalue()
+    return _export_generate_docx_from_snapshot(snapshot)
 
 
 def _try_fail(job_id: str, lease_token: str, error_code: str, error_message: str):
@@ -948,7 +635,10 @@ def main():
         "✓ Gemini Post-OCR (llm_postprocessor): mặc định=%s | model=%s | fallback=%s",
         "BẬT" if ENABLE_LLM_POSTPROCESS else "TẮT",
         os.environ.get("LLM_MODEL", "gemini-3.5-flash-lite"),
-        os.environ.get("LLM_FALLBACK_MODEL", "gemini-3.1-flash-lite,gemini-3.5-flash"),
+        os.environ.get(
+            "LLM_FALLBACK_MODEL",
+            "gemini-3.1-flash-lite,gemini-3.5-flash,gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash",
+        ),
     )
 
     preprocessor = ImagePreprocessor(enable_magic=ENABLE_MAGIC_FILTER)

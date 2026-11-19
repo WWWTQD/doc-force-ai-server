@@ -386,3 +386,98 @@ def test_vlm_batching_cap_metadata_strip_and_lineid_mismatch() -> None:
     assert out_mismatch["postprocessMeta"]["rejections"].get("REJECT_LINE_COUNT_MISMATCH") == 1
     assert all(not b.get("suggestions") for b in out_mismatch["blocks"])
     assert all(b.get("isWarning") is True for b in out_mismatch["blocks"])
+
+
+def test_chunked_batching_splits_large_pages_and_preserves_partial_success() -> None:
+    # > 8 lines (11 lines) -> auto-splits into [6, 5] candidate chunks with neighbor context
+    lines_11 = [f"Thi hn np đon số {i}" for i in range(1, 12)]
+    layout_11 = _make_layout(lines_11, confs=[0.75] * 11)
+
+    class ChunkStub:
+        is_cloud = True
+        provider_name = "chunk-stub"
+        model_name = "chunk-model"
+        needs_crop_image = False
+
+        def __init__(self, fail_chunk: int | None = None) -> None:
+            self.fail_chunk = fail_chunk
+            self.calls: list[list[dict[str, Any]]] = []
+
+        def correct_lines_batch(self, page_payload: dict[str, Any], *, local_only: bool = False, deadline_ts: float):
+            del local_only, deadline_ts
+            self.calls.append(page_payload["lines"])
+            idx_call = len(self.calls)
+            if self.fail_chunk == idx_call:
+                return (
+                    None,
+                    LLMUsageLog(
+                        provider_type="cloud",
+                        model=self.model_name,
+                        status="FAILED_SAFE",
+                        error_reason="SERVER_ERROR",
+                    ),
+                )
+            return (
+                {
+                    "lines": [
+                        {
+                            "lineId": ln["lineId"],
+                            "corrected": ln["text"].replace("Thi hn np đon", "Thời hạn nộp đơn"),
+                            "confidence": 0.95,
+                            "changes": [{"from": "hn", "to": "hạn", "reason": "sửa dấu"}],
+                        }
+                        for ln in page_payload["lines"]
+                        if ln.get("isCandidate")
+                    ]
+                },
+                LLMUsageLog(provider_type="cloud", model=self.model_name, status="ok"),
+            )
+
+        def verify_crops_vlm(self, items: list[dict[str, Any]], *, local_only: bool = False, deadline_ts: float):
+            del items, local_only, deadline_ts
+            raise AssertionError("VLM should not run")
+
+    stub_ok = ChunkStub()
+    out_11 = process_page(
+        layout_11,
+        options={"llmPostprocess": True, "autoApply": True},
+        config=_mock_cfg(page_deadline_seconds=90.0),
+        llm_client=stub_ok,
+    )
+    assert out_11["postprocessMeta"]["status"] == "COMPLETED"
+    assert out_11["postprocessMeta"]["llmCalls"] == 2
+    assert out_11["postprocessMeta"]["suggestionsCreated"] == 11
+    cand_counts = [sum(1 for ln in call if ln.get("isCandidate")) for call in stub_ok.calls]
+    assert cand_counts == [6, 5]
+    # Boundary context line included with isCandidate=False
+    assert any(not ln.get("isCandidate") for ln in stub_ok.calls[0])
+    assert all("Thời hạn nộp đơn" in b["text"] for b in out_11["blocks"])
+
+    # <= 8 lines but > 900 chars -> also splits into chunks
+    long_lines = [("Thi hn np đon " * 15).strip() for _ in range(5)]
+    out_long = process_page(
+        _make_layout(long_lines, confs=[0.75] * 5),
+        options={"llmPostprocess": True, "autoApply": True},
+        config=_mock_cfg(page_deadline_seconds=90.0),
+        llm_client=ChunkStub(),
+    )
+    assert out_long["postprocessMeta"]["status"] == "COMPLETED"
+    assert out_long["postprocessMeta"]["llmCalls"] == 2
+    assert out_long["postprocessMeta"]["suggestionsCreated"] == 5
+
+    # Partial failure: chunk 2 returns FAILED_SAFE -> chunk 1's 6 corrections are still preserved
+    stub_partial = ChunkStub(fail_chunk=2)
+    out_partial = process_page(
+        layout_11,
+        options={"llmPostprocess": True, "autoApply": True},
+        config=_mock_cfg(page_deadline_seconds=90.0),
+        llm_client=stub_partial,
+    )
+    assert out_partial["postprocessMeta"]["status"] == "COMPLETED"
+    assert out_partial["postprocessMeta"]["llmCalls"] == 2
+    assert out_partial["postprocessMeta"]["suggestionsCreated"] == 6
+    assert out_partial["postprocessMeta"]["skippedReason"] == "PARTIAL_CHUNK_FAILURE:SERVER_ERROR"
+    for b in out_partial["blocks"][:6]:
+        assert "Thời hạn nộp đơn" in b["text"]
+    for b in out_partial["blocks"][6:]:
+        assert "Thi hn np đon" in b["text"]

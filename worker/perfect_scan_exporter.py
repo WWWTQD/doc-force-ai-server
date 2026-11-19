@@ -39,6 +39,7 @@ if WORKER_DIR not in sys.path:
 if TRAINING_DIR not in sys.path:
     sys.path.insert(0, TRAINING_DIR)
 
+from export_layout import generate_docx_from_snapshot, generate_pdf_from_snapshot
 from scan_pipeline import ScanPipeline
 from train_with_real_scanner_data import DeepDocumentTypographyResNet
 
@@ -158,9 +159,9 @@ class PerfectScanExporter:
         blocks = res.layout.get("blocks", [])
         LOG.info("Tổng số khối chữ nhận diện được: %d khối.", len(blocks))
 
-        # 2. Xử lý Typography & Format cho từng block
-        formatted_blocks = []
-        for b in blocks:
+        # 2. Bảo toàn style từ OCREngine (chỉ bổ sung nếu block thiếu metadata)
+        out_blocks = []
+        for idx, b in enumerate(blocks, start=1):
             text = (b.get("text") or "").strip()
             if not text:
                 continue
@@ -168,102 +169,54 @@ class PerfectScanExporter:
             bx1, by1, bx2, by2 = b["bbox"]
             bx1, by1 = max(0, bx1), max(0, by1)
             bx2, by2 = min(w_page, bx2), min(h_page, by2)
-
             crop = restored_img[by1:by2, bx1:bx2] if by2 > by1 and bx2 > bx1 else None
-            typo = self._predict_typography(crop)
 
-            align, is_indent = self._determine_alignment(text, [bx1, by1, bx2, by2], w_page)
+            blk_copy = dict(b)
+            blk_copy["order"] = blk_copy.get("order", idx)
+            st = dict(blk_copy.get("style") or {})
+            if not st.get("fontFamily") or not st.get("fontSizePt"):
+                typo = self._predict_typography(crop)
+                st.setdefault("fontFamily", typo["font_family"])
+                st.setdefault("fontSizePt", typo["size_pt"])
+                if "bold" not in st:
+                    st["bold"] = typo["is_bold"]
+                if "italic" not in st:
+                    st["italic"] = typo["is_italic"]
+            blk_copy["style"] = st
+            out_blocks.append(blk_copy)
 
-            # Heuristics bổ sung cho tiêu đề chính
-            if any(kw in text.upper() for kw in ["CỘNG HÒA", "ĐỘC LẬP", "QUYẾT ĐỊNH", "ĐẠI HỌC", "TRƯỜNG"]):
-                typo["is_bold"] = True
+        snapshot = {
+            "pages": [
+                {
+                    "pageNumber": 1,
+                    "layout": {
+                        "schemaVersion": 1,
+                        "pageNumber": 1,
+                        "width": w_page,
+                        "height": h_page,
+                        "blocks": out_blocks,
+                    },
+                }
+            ]
+        }
 
-            formatted_blocks.append({
-                "text": text,
-                "bbox": [bx1, by1, bx2, by2],
-                "is_bold": typo["is_bold"],
-                "is_italic": typo["is_italic"],
-                "font_family": typo["font_family"],
-                "size_pt": typo["size_pt"],
-                "alignment": align,
-                "is_indent": is_indent,
-            })
-
-        # 3. Tạo file Word (.docx) sạch sẽ chuẩn 100%
+        # 3. Tạo file Word (.docx) & PDF (.pdf) dùng chung engine bố cục nhiều cột
         out_dir = os.path.join(ROOT_DIR, "data", "output")
         os.makedirs(out_dir, exist_ok=True)
         docx_path = os.path.join(out_dir, f"{output_base_name}.docx")
-
-        doc = docx.Document()
-        # Chuẩn hóa khổ giấy A4 (8.27 x 11.69 inches)
-        section = doc.sections[0]
-        section.page_width = Inches(8.27)
-        section.page_height = Inches(11.69)
-        # Lề chuẩn văn bản hành chính Việt Nam (Nghị định 30/2020/NĐ-CP): Trái 3cm, Phải 2cm, Trên 2cm, Dưới 2cm
-        section.left_margin = Inches(1.18)   # ~3.0 cm
-        section.right_margin = Inches(0.79)  # ~2.0 cm
-        section.top_margin = Inches(0.79)    # ~2.0 cm
-        section.bottom_margin = Inches(0.79) # ~2.0 cm
-
-        for fb in formatted_blocks:
-            p = doc.add_paragraph()
-            p.alignment = fb["alignment"]
-            if fb["is_indent"]:
-                p.paragraph_format.first_line_indent = Inches(0.4)  # Thụt đầu dòng 1cm
-            p.paragraph_format.space_before = Pt(1)
-            p.paragraph_format.space_after = Pt(3)
-            p.paragraph_format.line_spacing = 1.15
-
-            run = p.add_run(fb["text"])
-            run.font.name = fb["font_family"]
-            run.font.size = Pt(max(11.0, min(18.0, fb["size_pt"])))
-            run.font.bold = fb["is_bold"]
-            run.font.italic = fb["is_italic"]
-            run.font.color.rgb = RGBColor(10, 10, 10)  # Mực đen chuẩn
-
-        doc.save(docx_path)
+        with open(docx_path, "wb") as f_docx:
+            f_docx.write(generate_docx_from_snapshot(snapshot))
         LOG.info("-> Đã xuất xong File Word chuẩn: %s", docx_path)
 
-        # 4. Tạo file PDF (.pdf) nền trắng tinh khiết vector/raster độ phân giải cao A4
         pdf_path = os.path.join(out_dir, f"{output_base_name}.pdf")
-        # Khổ A4 ở 300 DPI: 2480 x 3508 pixels
-        a4_w, a4_h = 2480, 3508
-        canvas_pdf = Image.new("RGB", (a4_w, a4_h), (255, 255, 255))
-        draw_pdf = ImageDraw.Draw(canvas_pdf)
-
-        # Vẽ từng dòng lên canvas trắng tinh
-        curr_y = int(a4_h * 0.08)
-        font_regular = ImageFont.truetype(r"C:\Windows\Fonts\times.ttf", 36)
-        font_bold = ImageFont.truetype(r"C:\Windows\Fonts\timesbd.ttf", 38)
-        font_italic = ImageFont.truetype(r"C:\Windows\Fonts\timesi.ttf", 34)
-
-        for fb in formatted_blocks:
-            fnt = font_bold if fb["is_bold"] else (font_italic if fb["is_italic"] else font_regular)
-            tb = draw_pdf.textbbox((0, 0), fb["text"], font=fnt)
-            tw = tb[2] - tb[0]
-            th = tb[3] - tb[1]
-
-            if fb["alignment"] == WD_ALIGN_PARAGRAPH.CENTER:
-                draw_x = (a4_w - tw) // 2
-            elif fb["alignment"] == WD_ALIGN_PARAGRAPH.RIGHT:
-                draw_x = a4_w - int(a4_w * 0.09) - tw
-            else:
-                indent_px = int(a4_w * 0.04) if fb["is_indent"] else 0
-                draw_x = int(a4_w * 0.12) + indent_px
-
-            draw_pdf.text((draw_x, curr_y), fb["text"], fill=(15, 15, 15), font=fnt)
-            curr_y += th + 22
-
-            if curr_y > a4_h - int(a4_h * 0.08):
-                break
-
-        canvas_pdf.save(pdf_path, "PDF", resolution=300.0)
+        with open(pdf_path, "wb") as f_pdf:
+            f_pdf.write(generate_pdf_from_snapshot(snapshot))
         LOG.info("-> Đã xuất xong File PDF nền trắng tinh khiết: %s", pdf_path)
 
         return {
             "docx": docx_path,
             "pdf": pdf_path,
-            "total_blocks": len(formatted_blocks),
+            "total_blocks": len(out_blocks),
             "restored_image_shape": f"{w_page}x{h_page}",
         }
 

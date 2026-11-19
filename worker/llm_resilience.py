@@ -106,6 +106,7 @@ class LLMResilienceController:
         self._thinking_disabled: bool = False
         self._warned_tags: set[str] = set()
         self._model_overrides: dict[str, str] = {}
+        self._unavailable_models: set[str] = set()
 
     def get_model_override(self, kind: str) -> str | None:
         with self._lock:
@@ -114,6 +115,18 @@ class LLMResilienceController:
     def set_model_override(self, kind: str, model_name: str) -> None:
         with self._lock:
             self._model_overrides[kind] = model_name
+
+    def mark_model_unavailable(self, model_name: str) -> None:
+        if not model_name:
+            return
+        with self._lock:
+            self._unavailable_models.add(model_name)
+
+    def is_model_unavailable(self, model_name: str) -> bool:
+        if not model_name:
+            return False
+        with self._lock:
+            return model_name in self._unavailable_models
 
     @property
     def disabled_reason(self) -> str | None:

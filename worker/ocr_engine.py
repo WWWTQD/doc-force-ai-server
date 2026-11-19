@@ -702,23 +702,25 @@ class OCREngine:
 
             h_box = float(0.5 * (np.linalg.norm(pts[0] - pts[3]) + np.linalg.norm(pts[1] - pts[2])))
             raw_items.append((ym, x1, pts, h_box))
-            if bw > width * 0.15 and 22.0 <= h_box <= ih * 0.036:
+            min_box_h = min(22.0, max(10.0, float(ih) * 0.015))
+            if bw > width * 0.15 and min_box_h <= h_box <= ih * 0.036:
                 single_line_heights.append(h_box)
 
         if not raw_items:
             return []
 
+        min_single_h = max(10.0, float(ih) * 0.015)
         max_single_h = max(88.0, float(ih) * 0.036)
         if single_line_heights:
-            single_h = float(np.clip(np.median(single_line_heights), 26.0, max_single_h))
+            single_h = float(np.clip(np.median(single_line_heights), min_single_h, max_single_h))
         else:
             all_h = [it[3] for it in raw_items]
-            single_h = float(np.clip(np.median(all_h), 26.0, max_single_h))
+            single_h = float(np.clip(np.median(all_h), min_single_h, max_single_h))
 
         # _rotate_crop cộng thêm 2 * pad_y (~0.32 * single_h), nên dòng đơn thực tế có ch ~ 1.32-1.48 * single_h
-        # và box gộp 2 dòng có ch >= 1.95 * single_h. Đặt split_thresh = max(68.0, single_h * 1.68)
-        # đảm bảo tuyệt đối không cắt ngang dòng đơn mà vẫn tách chính xác mọi box gộp 2 dòng.
-        split_thresh = max(68.0, single_h * 1.68)
+        # và box gộp 2 dòng có ch >= 1.95 * single_h. Dùng ngưỡng thích ứng theo kích thước ảnh để không cắt đôi dòng đơn.
+        split_floor = 44.0 if ih < 1000 else 68.0
+        split_thresh = max(split_floor, single_h * 1.68)
 
         # Ước lượng độ dốc nghiêng cục bộ (local tilt slope dy/dx) theo vùng Y của trang từ các dòng rộng
         # để chuẩn hóa toạ độ Y chính xác ngay cả khi trang sách hơi cong ở đầu/cuối trang.
@@ -853,13 +855,8 @@ class OCREngine:
             placed = False
             for cluster in line_clusters:
                 mean_y_norm = float(np.mean([c[0] for c in cluster]))
-                max_x_ov = max((min(sx2, c[3]) - max(sx1, c[2])) for c in cluster)
-                # Hai mảnh nằm cạnh nhau (không đè X, ví dụ "TIN MIỀN BẮC PHÁT ĐÊM") cho phép sai số Y 0.55 * single_h;
-                # hai dòng chồng lấp X chỉ cùng cluster khi chênh lệch Y đã bù nghiêng < 0.42 * single_h.
-                same_horiz_row = (abs(sub_y_norm - mean_y_norm) < single_h * 0.42) or (
-                    max_x_ov <= 0.15 * sw and abs(sub_y_norm - mean_y_norm) < single_h * 0.55
-                )
-                if same_horiz_row:
+                # Khôi phục ngưỡng gom hàng chuẩn 0.42 * single_h để tránh dính 2 dòng sát nhau ở chân trang
+                if abs(sub_y_norm - mean_y_norm) < single_h * 0.42:
                     # Kiểm tra có trùng lặp ngang với mảnh đã có trong dòng không
                     is_dup = False
                     for idx_c, (cyn, cyr, cx1, cx2, cpoly, ccrop) in enumerate(cluster):
@@ -878,10 +875,11 @@ class OCREngine:
             if not placed:
                 line_clusters.append([item])
 
-        # Sắp xếp các dòng theo Y đã bù nghiêng và các mảnh trong từng dòng theo X từ trái sang phải
+        # Sắp xếp các dòng theo Y đã bù nghiêng và tách các cụm cột nằm cách xa nhau theo phương ngang
         line_clusters.sort(key=lambda cl: float(np.mean([c[0] for c in cl])))
+        col_gap_thresh = max(1.8 * single_h, float(width) * 0.045)
 
-        # Bước 3: Chuẩn bị danh sách ảnh từng dòng đưa vào VietOCR theo batch (giữ nguyên toàn dòng để mô hình seq2seq có ngữ cảnh đầy đủ)
+        # Bước 3: Chuẩn bị danh sách ảnh từng cụm/dòng đưa vào VietOCR theo batch (không gộp ngang qua khe cột)
         line_polys: list[np.ndarray] = []
         line_y_norms: list[float] = []
         line_piece_ranges: list[tuple[int, int]] = []
@@ -889,38 +887,47 @@ class OCREngine:
 
         for cluster in line_clusters:
             cluster.sort(key=lambda c: c[2])
-            # Lọc bỏ mảnh cách quá xa ở rìa phải (chữ nháp lề phải)
-            filtered_cl = []
+            col_sub_clusters: list[list[tuple[float, float, float, float, np.ndarray, np.ndarray]]] = []
             for item in cluster:
-                sub_y_norm, sub_y_raw, sx1, sx2, sub_poly, sub_crop = item
-                if filtered_cl and (sx1 - filtered_cl[-1][3]) > width * 0.22 and (sx2 - sx1) < 220:
+                _, _, sx1, _, _, _ = item
+                if not col_sub_clusters:
+                    col_sub_clusters.append([item])
+                else:
+                    prev_x2 = col_sub_clusters[-1][-1][3]
+                    if (sx1 - prev_x2) > col_gap_thresh:
+                        col_sub_clusters.append([item])
+                    else:
+                        col_sub_clusters[-1].append(item)
+
+            for g_idx, sub_cl in enumerate(col_sub_clusters):
+                if not sub_cl:
                     continue
-                filtered_cl.append(item)
-            if not filtered_cl:
-                continue
+                sub_x1 = sub_cl[0][2]
+                sub_x2 = sub_cl[-1][3]
+                sub_w = sub_x2 - sub_x1
+                # Lọc bỏ mảnh chữ nháp quá hẹp nằm tuốt ở rìa phải ngoài cột văn bản
+                if g_idx > 0 and sub_w < min(180.0, float(width) * 0.12) and sub_x1 > float(width) * 0.86:
+                    continue
 
-            # Gộp polygon của các mảnh trên cùng 1 dòng (giữ đúng chiều cao vuông góc thực tế của dòng)
-            if len(filtered_cl) == 1:
-                merged_poly = filtered_cl[0][4]
-            else:
-                p_first = filtered_cl[0][4]
-                p_last = filtered_cl[-1][4]
-                merged_poly = np.array([p_first[0], p_last[1], p_last[2], p_first[3]], dtype=np.float32)
+                if len(sub_cl) == 1:
+                    merged_poly = sub_cl[0][4]
+                else:
+                    p_first = sub_cl[0][4]
+                    p_last = sub_cl[-1][4]
+                    merged_poly = np.array([p_first[0], p_last[1], p_last[2], p_first[3]], dtype=np.float32)
 
-            cluster_y_norm = float(np.mean([c[0] for c in filtered_cl]))
-            start_idx = len(all_pil_pieces)
-            for _, _, _, _, _, seg_crop in filtered_cl:
-                wch, wcw = seg_crop.shape[:2]
-                # Giữ nguyên toàn bộ 1 dòng để VietOCR (vgg_seq2seq) đọc trọn vẹn ngữ cảnh từ đầu đến cuối dòng,
-                # tuyệt đối không cắt ngang làm gãy đôi từ hoặc rơi chữ ở giữa dòng.
-                nw = min(960, max(32, int(round(wcw * (32.0 / max(1, wch))))))
-                rs_crop = cv2.resize(seg_crop, (nw, 32), interpolation=cv2.INTER_AREA)
-                all_pil_pieces.append(Image.fromarray(cv2.cvtColor(rs_crop, cv2.COLOR_BGR2RGB)))
-            end_idx = len(all_pil_pieces)
-            if end_idx > start_idx:
-                line_polys.append(merged_poly)
-                line_y_norms.append(cluster_y_norm)
-                line_piece_ranges.append((start_idx, end_idx))
+                cluster_y_norm = float(np.mean([c[0] for c in sub_cl]))
+                start_idx = len(all_pil_pieces)
+                for _, _, _, _, _, seg_crop in sub_cl:
+                    wch, wcw = seg_crop.shape[:2]
+                    nw = min(960, max(32, int(round(wcw * (32.0 / max(1, wch))))))
+                    rs_crop = cv2.resize(seg_crop, (nw, 32), interpolation=cv2.INTER_AREA)
+                    all_pil_pieces.append(Image.fromarray(cv2.cvtColor(rs_crop, cv2.COLOR_BGR2RGB)))
+                end_idx = len(all_pil_pieces)
+                if end_idx > start_idx:
+                    line_polys.append(merged_poly)
+                    line_y_norms.append(cluster_y_norm)
+                    line_piece_ranges.append((start_idx, end_idx))
 
         if not all_pil_pieces:
             return []
@@ -1134,17 +1141,17 @@ class OCREngine:
             cw = bx2 - bx1
             if ch < 12 or cw < 75:
                 return False
-            y_start = max(0, by1 + int(ch * 0.65))
-            y_end = min(height, by2 + max(3, int(ch * 0.14)))
+            y_start = max(0, by1 + int(ch * 0.60))
+            y_end = min(height, by2 + max(6, int(ch * 0.24)))
             strip = gray_full[y_start:y_end, max(0, bx1):min(width, bx2)]
             if strip.size == 0 or strip.shape[0] < 3 or strip.shape[1] < 50:
                 return False
             _, bw_inv = cv2.threshold(strip, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            k_len = max(45, int(cw * 0.42))
+            k_len = max(35, int(cw * 0.36))
             horiz_k = cv2.getStructuringElement(cv2.MORPH_RECT, (k_len, 1))
             horiz_lines = cv2.morphologyEx(bw_inv, cv2.MORPH_OPEN, horiz_k)
             row_max = int(horiz_lines.max(axis=0).astype(bool).sum()) if horiz_lines.size > 0 else 0
-            return row_max >= int(cw * 0.48)
+            return row_max >= int(cw * 0.40)
 
         def _measure_crop_stroke_and_slant(crop_g: np.ndarray) -> tuple[float, float, float]:
             """
@@ -1498,6 +1505,88 @@ class OCREngine:
                 LOG.debug("Phát hiện bảng tự động bỏ qua: %s", tbl_exc)
 
         import re
+
+        _BULLET_OR_NUM_RE = re.compile(
+            r"^(?:\*{1,2}\s*)?(?:[-–—+*•]\s*\S|(?:\d{1,3}[\.\)]|[a-dA-D][\.\)])\s+\S)"
+        )
+        _FORM_FIELD_RE = re.compile(
+            r"^(?:\*{1,2}\s*)?(?:[-–—+*•]\s*)?(?:"
+            r"Ông\s*/?\s*bà[:.,\s]"
+            r"|Họ\s+và\s+tên\s*:"
+            r"|Số\s+CCC[D:]?"
+            r"|CCC[D:]"
+            r"|Sinh\s+ngày\s*:"
+            r"|Ngày\s+sinh\s*:"
+            r"|Giới\s+tính\s*:"
+            r"|Lớp\s*:"
+            r"|Thuộc\s+khoa\s*:"
+            r"|Khoa\s*:"
+            r"|Ngành\s*:"
+            r"|Trình\s+độ(?:\s+đào\s+tạo)?\s*:"
+            r"|Khóa\s+học\s*:"
+            r"|Hình\s+thức(?:\s+đào\s+tạo)?\s*:"
+            r"|Địa\s+chỉ(?:\s+thường\s+trú)?\s*:"
+            r"|Ghi\s+chú\s*:"
+            r"|Nơi\s+nhận\s*:"
+            r")",
+            re.IGNORECASE,
+        )
+        _TITLE_KEYWORDS = (
+            "GIẤY XÁC NHẬN",
+            "XÁC NHẬN",
+            "TỜ KHAI",
+            "QUYẾT ĐỊNH",
+            "THÔNG BÁO",
+            "TỜ TRÌNH",
+            "HỢP ĐỒNG",
+            "LỜI KÊU GỌI",
+            "CÁC HOẠT ĐỘNG CHÍNH",
+        )
+        _STANDALONE_TITLE_WORDS = (
+            "GIẤY XÁC NHẬN",
+            "XÁC NHẬN",
+            "QUYẾT ĐỊNH",
+            "THÔNG BÁO",
+            "TỜ TRÌNH",
+            "TỜ KHAI",
+            "HỢP ĐỒNG",
+            "LỜI KÊU GỌI",
+        )
+
+        # Đánh dấu các box nằm cùng hàng ngang nhưng tách biệt theo cột X (Quốc hiệu, các trường biểu mẫu)
+        n_raw = len(raw_boxes)
+        has_left_peer = [False] * n_raw
+        has_right_peer = [False] * n_raw
+        row_peer_count = [1] * n_raw
+        for i_r in range(n_raw):
+            if i_r in consumed_box_indices:
+                continue
+            bx1_i, by1_i, bx2_i, by2_i = raw_boxes[i_r]["bbox"]
+            h_i = max(1.0, float(by2_i - by1_i))
+            yn_i = float(raw_boxes[i_r].get("y_norm", 0.5 * (by1_i + by2_i)))
+            peers_i = 1
+            for j_r in range(n_raw):
+                if j_r == i_r or j_r in consumed_box_indices:
+                    continue
+                bx1_j, by1_j, bx2_j, by2_j = raw_boxes[j_r]["bbox"]
+                h_j = max(1.0, float(by2_j - by1_j))
+                yn_j = float(raw_boxes[j_r].get("y_norm", 0.5 * (by1_j + by2_j)))
+                y_ov_rj = min(by2_i, by2_j) - max(by1_i, by1_j)
+                min_h_rj = min(h_i, h_j)
+                same_y_rj = (y_ov_rj >= 0.45 * min_h_rj) or (abs(yn_i - yn_j) < max(6.0, 0.42 * min_h_rj))
+                if not same_y_rj:
+                    continue
+                if max(bx1_i, bx1_j) >= min(bx2_i, bx2_j) - 10:
+                    peers_i += 1
+                    if bx2_j <= bx1_i + 10:
+                        has_left_peer[i_r] = True
+                    elif bx1_j >= bx2_i - 10:
+                        has_right_peer[i_r] = True
+            row_peer_count[i_r] = peers_i
+
+        min_indent = max(12.0, col_width * 0.032, median_body_h * 0.75)
+        max_indent = max(240.0, col_width * 0.22)
+
         line_items = []
         for idx_b, b in enumerate(raw_boxes):
             if idx_b in consumed_box_indices:
@@ -1505,6 +1594,7 @@ class OCREngine:
             bx1, by1, bx2, by2 = b["bbox"]
             b_width = bx2 - bx1
             b_center = (bx1 + bx2) / 2
+            is_peer_row = has_left_peer[idx_b] or has_right_peer[idx_b]
 
             normalized_text = normalize_vietnamese_text(b["text"]).strip()
             if not normalized_text or is_gibberish_or_handwriting_text(normalized_text):
@@ -1512,15 +1602,26 @@ class OCREngine:
             if len(normalized_text) >= 6 and (normalized_text.count("0") / len(normalized_text)) > 0.55:
                 continue
 
-            # Bỏ qua mảnh chữ nháp rất ngắn nằm lơ lửng không phải số trang hay tiêu đề
+            # Cứu các mảnh có ý nghĩa sát lề trái (vd "* Ghi chú:"), nhãn có ":", hoặc chú thích ở mép dưới trang
             is_page_num = len(normalized_text) <= 4 and normalized_text.isdigit() and by1 > height * 0.80
             is_chapter_prefix = bool(re.match(r"^(Chương|CHƯƠNG|Phần|PHẦN)\s+\d+", normalized_text))
             is_top_header_piece = normalized_text.isupper() and by1 < height * 0.25 and len(normalized_text) >= 2
+            near_left_margin = abs(bx1 - dominant_left) <= col_width * 0.08
+            is_colon_label = normalized_text.endswith(":") and b_width >= 20
+            is_bottom_note = by1 > height * 0.85 and len(normalized_text) >= 4
+            is_form_label = bool(_FORM_FIELD_RE.match(normalized_text))
+            is_bullet_or_num = bool(_BULLET_OR_NUM_RE.match(normalized_text))
+
             if (
                 b_width < col_width * 0.16
                 and not is_page_num
                 and not is_chapter_prefix
                 and not is_top_header_piece
+                and not near_left_margin
+                and not is_colon_label
+                and not is_bottom_note
+                and not is_peer_row
+                and not is_form_label
                 and len(normalized_text) < 12
                 and b["confidence"] < 0.82
             ):
@@ -1555,15 +1656,54 @@ class OCREngine:
             left_gap = bx1 - dominant_left
             right_gap = dominant_right - bx2
             is_uppercase = normalized_text.isupper() and len(normalized_text) > 3
-            is_centered = (
-                left_gap >= col_width * 0.08
-                and right_gap >= col_width * 0.08
-                and abs(left_gap - right_gap) < col_width * 0.14
-                and b_width < col_width * 0.78
-                and (is_uppercase or is_chapter_prefix or is_page_num or "độc lập" in lower_txt or "cộng hòa" in lower_txt)
+
+            # Phân biệt chính xác 2 cột Quốc hiệu đầu trang vs hàng biểu mẫu nhiều cột vs khối chữ ký nửa phải
+            is_top_admin_pair = (
+                is_peer_row
+                and row_peer_count[idx_b] == 2
+                and by1 < height * 0.25
+                and not is_form_label
+                and not is_bullet_or_num
+                and (
+                    is_uppercase
+                    or any(kw in lower_txt for kw in ("độc lập", "cộng hòa", "đại học", "trường ", "ủy ban", "bộ ", "sở "))
+                )
             )
+            is_right_half_block = (
+                not is_peer_row
+                and not is_page_num
+                and bx1 > (dominant_left + 0.35 * col_width)
+                and b_center > (col_center + 0.08 * col_width)
+            )
+            is_geom_centered = (
+                not is_peer_row
+                and not is_right_half_block
+                and b_width < col_width * 0.80
+                and (
+                    (left_gap >= col_width * 0.08 and right_gap >= col_width * 0.08 and abs(left_gap - right_gap) < col_width * 0.14)
+                    or (left_gap >= col_width * 0.05 and right_gap >= col_width * 0.05 and abs(b_center - col_center) <= col_width * 0.06 and is_uppercase)
+                )
+            )
+            is_centered = is_geom_centered and (
+                is_uppercase
+                or is_chapter_prefix
+                or is_page_num
+                or ("độc lập" in lower_txt)
+                or ("cộng hòa" in lower_txt)
+                or (by1 < height * 0.10)
+                or (typo.get("bold", False) or sw_r >= median_page_sw * 1.08 or len(normalized_text) <= 45)
+            )
+
             diff_from_left = bx1 - dominant_left
-            is_indented = (diff_from_left >= max(34, col_width * 0.032)) and (diff_from_left <= max(240, col_width * 0.22))
+            is_indented = (
+                not is_peer_row
+                and not is_right_half_block
+                and not is_centered
+                and not is_form_label
+                and not is_bullet_or_num
+                and (diff_from_left >= min_indent)
+                and (diff_from_left <= max_indent)
+            )
 
             # Phân loại chính xác cấp độ Tiêu đề (Heading Levels 0, 1, 2, 3) & Đề mục nghiêng
             is_level3_heading = bool(re.match(r"^\d+\.\d+\.\d+\.?\s*\S+", normalized_text))
@@ -1573,24 +1713,44 @@ class OCREngine:
             )
             is_sec_heading = is_level1_heading or is_level2_heading or is_level3_heading
 
+            # Tuyệt đối không biến dòng sát lề trái / bullet / dòng có lề phải sát mép phải thành tiêu đề chính
+            allows_title_kw = (
+                not is_peer_row
+                and not is_right_half_block
+                and not is_bullet_or_num
+                and not is_form_label
+                and (is_centered or (not near_left_margin and (is_uppercase or by1 < height * 0.40)))
+            )
             is_main_title = (
                 is_chapter_prefix
-                or any(
-                    kw in upper_txt
-                    for kw in ["GIẤY XÁC NHẬN", "TỜ KHAI", "QUYẾT ĐỊNH", "THÔNG BÁO", "TỜ TRÌNH", "HỢP ĐỒNG", "CÁC HOẠT ĐỘNG CHÍNH"]
+                or (
+                    allows_title_kw
+                    and any(kw in upper_txt for kw in _TITLE_KEYWORDS)
+                    and (is_centered or is_uppercase or b_width < col_width * 0.72)
                 )
-                or (is_uppercase and not is_sec_heading and by1 < height * 0.35)
+                or (
+                    not is_peer_row
+                    and not is_right_half_block
+                    and not is_form_label
+                    and not is_bullet_or_num
+                    and is_uppercase
+                    and not is_sec_heading
+                    and by1 < height * 0.35
+                    and (is_centered or abs(b_center - col_center) <= col_width * 0.08)
+                )
             )
 
             is_admin_header = (
-                any(kw in upper_txt for kw in ["CỘNG HÒA XÃ HỘI", "ĐỘC LẬP - TỰ DO"])
+                is_top_admin_pair
+                or any(kw in upper_txt for kw in ["CỘNG HÒA XÃ HỘI", "ĐỘC LẬP - TỰ DO"])
                 or bool(re.match(r"^PHẦN\s+(?:THỨ\s+)?(?:\d+|[IVX]+)\b", upper_txt))
                 or is_main_title
             )
 
-            # Đề mục con in nghiêng đứng riêng một dòng (ví dụ: "Về kinh tế:", "Về chính trị - xã hội:", "Thứ nhất, về điểm tương đồng")
+            # Đề mục con in nghiêng đứng riêng một dòng
             is_sub_italic_header = (
-                bool(
+                not is_peer_row
+                and bool(
                     re.match(
                         r"^(?:[-+•]\s*)?(?:Về\s+[^:]{2,48}:?|Thứ\s+(?:nhất|hai|ba|tư)[,.]\s+[^.:]{2,65}:?)$",
                         normalized_text,
@@ -1600,15 +1760,29 @@ class OCREngine:
                 and b_width < col_width * 0.82
             )
 
-            if is_admin_header or (is_centered and is_uppercase) or is_sec_heading:
+            is_mid_centered_heading = (
+                is_centered
+                and not is_right_half_block
+                and not is_bullet_or_num
+                and not is_form_label
+                and by1 >= height * 0.10
+                and (
+                    is_uppercase
+                    or "hỡi đồng bào" in lower_txt
+                    or (typo.get("bold", False) and len(normalized_text) <= 45)
+                )
+            )
+
+            if is_right_half_block or is_form_label or is_bullet_or_num or is_top_admin_pair:
+                block_type = "paragraph"
+            elif is_admin_header or is_mid_centered_heading or is_sec_heading:
                 block_type = "heading"
             else:
                 block_type = _block_type_from_yolo(b["bbox"])
                 if block_type not in ("heading", "table", "list"):
                     block_type = "paragraph"
 
-            # Ước lượng cỡ chữ tỷ lệ thực: đoạn văn chuẩn giữ đồng nhất 13.0pt (tránh nhảy cỡ do dao động khung DBNet),
-            # chỉ phóng đại theo pixel thực đối với tiêu đề/khối lớn (ratio_h >= 1.38 hoặc heading) và thu nhỏ cho chú thích/số trang.
+            # Ước lượng cỡ chữ tỷ lệ thực
             line_h = float(by2 - by1)
             ratio_h = line_h / max(12.0, median_body_h)
             body_pt = 13.0
@@ -1617,7 +1791,9 @@ class OCREngine:
 
             if is_page_num:
                 estimated_pt = 11.5
-            elif block_type == "heading" or ratio_h >= 1.38:
+            elif is_top_admin_pair:
+                estimated_pt = 13.0
+            elif block_type == "heading" or (ratio_h >= 1.38 and not is_right_half_block):
                 estimated_pt = round(min(24.0, max(13.5, 0.72 * pixel_pt + 0.28 * ai_pt)) * 2.0) / 2.0
             elif ratio_h <= 0.68 and b_width < col_width * 0.55:
                 estimated_pt = round(max(10.0, min(12.0, pixel_pt)) * 2.0) / 2.0
@@ -1625,14 +1801,15 @@ class OCREngine:
                 estimated_pt = body_pt
 
             # Giữ phân cấp tối thiểu cho tiêu đề mục rõ ràng
-            if is_main_title:
-                estimated_pt = max(estimated_pt, 16.0 if not is_chapter_prefix else 15.5)
-            elif is_level1_heading:
-                estimated_pt = max(estimated_pt, 14.5)
-            elif is_level2_heading:
-                estimated_pt = max(estimated_pt, 14.0)
-            elif is_level3_heading:
-                estimated_pt = max(estimated_pt, 13.5)
+            if block_type == "heading":
+                if is_main_title or is_mid_centered_heading:
+                    estimated_pt = max(estimated_pt, 15.5 if (is_chapter_prefix or is_mid_centered_heading) else 16.0)
+                elif is_level1_heading:
+                    estimated_pt = max(estimated_pt, 14.5)
+                elif is_level2_heading:
+                    estimated_pt = max(estimated_pt, 14.0)
+                elif is_level3_heading:
+                    estimated_pt = max(estimated_pt, 13.5)
 
             line_font_family = typo.get("fontFamily", page_font_family)
             if b_width < col_width * 0.28:
@@ -1646,8 +1823,25 @@ class OCREngine:
             if is_page_num:
                 style_meta["textAlign"] = "center"
                 style_meta["bold"] = False
+            elif is_top_admin_pair:
+                style_meta["textAlign"] = "center"
+                style_meta["bold"] = is_uppercase or ("cộng hòa" in lower_txt) or ("độc lập" in lower_txt) or typo.get("bold", False)
+                if ("độc lập" in lower_txt and "hạnh phúc" in lower_txt) or has_ul:
+                    style_meta["underline"] = True
+            elif is_right_half_block:
+                style_meta["textAlign"] = "right"
+                if is_uppercase or typo.get("bold", False):
+                    style_meta["bold"] = True
+                if any(k in lower_txt for k in ["ngày ", "tháng ", "năm "]) or typo.get("italic", False):
+                    style_meta["italic"] = True
+            elif is_form_label or is_bullet_or_num or is_peer_row:
+                style_meta["textAlign"] = "left"
+                if (is_uppercase and not is_form_label) or normalized_text.startswith("Điều ") or typo.get("bold", False):
+                    style_meta["bold"] = True
+                if typo.get("italic", False):
+                    style_meta["italic"] = True
             elif block_type == "heading" or is_centered or is_admin_header:
-                style_meta["textAlign"] = "center" if (is_centered or is_admin_header or is_chapter_prefix or is_main_title) else "left"
+                style_meta["textAlign"] = "center" if (is_centered or is_admin_header or is_chapter_prefix or is_main_title or is_mid_centered_heading) else "left"
                 style_meta["bold"] = True
                 if is_level3_heading or (typo.get("italic", False) and not is_main_title and not is_level1_heading):
                     style_meta["italic"] = True
@@ -1666,7 +1860,10 @@ class OCREngine:
                 else:
                     style_meta["italic"] = True
             else:
-                style_meta["textAlign"] = "justify" if b_width > col_width * 0.65 else "left"
+                if b_width > col_width * 0.65 and (not near_left_margin or right_gap <= col_width * 0.14):
+                    style_meta["textAlign"] = "justify"
+                else:
+                    style_meta["textAlign"] = "left"
                 if is_indented:
                     style_meta["isIndented"] = True
                 if is_uppercase or normalized_text.startswith("Điều ") or typo.get("bold", False):
@@ -1677,22 +1874,29 @@ class OCREngine:
                     style_meta["underline"] = True
                     normalized_text = f"<u>{normalized_text}</u>"
 
-                # Phát hiện cụm mở đầu đoạn văn in nghiêng hoặc in đậm (Inline Lead-in Italic/Bold)
+                # Phát hiện cụm mở đầu đoạn văn in nghiêng cho văn bản xuôi
                 if not style_meta.get("bold") and not style_meta.get("italic") and "*" not in normalized_text:
                     lead_match = re.match(
-                        r"^((?:Phương pháp|Các phương pháp|Về mặt|Một là|Hai là|Ba là|Bốn là|Năm là|Thứ nhất|Thứ hai|-\s*[^:]{2,35})[^.:]{0,45}[.:])(\s+.*)?$",
+                        r"^((?:Phương pháp|Các phương pháp|Về mặt|Một là|Hai là|Ba là|Bốn là|Năm là|Thứ nhất|Thứ hai)[^.:]{0,45}[.:])(\s+.*)?$",
                         normalized_text,
                     )
                     if lead_match:
                         prefix_str = lead_match.group(1)
                         rest_str = lead_match.group(2) or ""
-                        prefix_w_px = int(b_width * min(0.85, len(prefix_str) / max(1.0, float(len(normalized_text)))))
-                        sub_crop_g = gray_full[max(0, by1):min(height, by2), max(0, bx1):min(width, bx1 + max(30, prefix_w_px))]
-                        p_sw, p_slant, _ = _measure_crop_stroke_and_slant(sub_crop_g)
-                        if prefix_str.startswith("-"):
-                            normalized_text = f"**{prefix_str}**{rest_str}" if p_sw >= median_page_sw * 1.12 else normalized_text
-                        elif (p_slant - median_page_slant) >= 4.5 or prefix_str.lower().startswith(("phương pháp", "các phương pháp", "về mặt")):
+                        if (typo.get("rel_slant", 0.0)) >= 4.5 or prefix_str.lower().startswith(("phương pháp", "các phương pháp", "về mặt")):
                             normalized_text = f"*{prefix_str}*{rest_str}"
+
+            standalone_flag = bool(
+                is_sub_italic_header
+                or is_page_num
+                or is_chapter_prefix
+                or is_peer_row
+                or is_right_half_block
+                or (by1 < height * 0.10 and is_centered)
+                or is_mid_centered_heading
+                or is_form_label
+                or is_bullet_or_num
+            )
 
             line_items.append({
                 "type": block_type,
@@ -1701,20 +1905,27 @@ class OCREngine:
                 "confidence": float(b["confidence"]),
                 "style": style_meta,
                 "is_indented": is_indented,
-                "standalone_line": bool(is_sub_italic_header or is_page_num or is_chapter_prefix),
+                "standalone_line": standalone_flag,
                 "y_norm": cur_y_norm,
+                "is_peer_row": is_peer_row,
             })
 
         if detected_tables:
             line_items.extend(detected_tables)
             line_items.sort(key=lambda it: (it.get("y_norm", it["bbox"][1]), it["bbox"][0]))
 
-        # Gộp các dòng liên tiếp thuộc cùng một đoạn văn hoặc tiêu đề dài bị tràn dòng (Paragraph & Wrapped-Heading Merging)
+        # Gộp các dòng liên tiếp thuộc cùng một đoạn văn hoặc tiêu đề dài bị tràn dòng
         blocks = []
         new_para_prefix = re.compile(
-            r"^([-+*•]|\d+[\.\)]|[a-d][\.\)]|Chương\s+\d+|Một là|Hai là|Ba là|Bốn là|Năm là|Thứ nhất|Thứ hai|Về kinh tế|Về chính trị|Về văn hóa|Về xã hội|Như vậy,|Từ thực tiễn)\b",
+            r"^(?:[-–—+*•]\s*\S|(?:\d{1,3}[\.\)]|[a-dA-D][\.\)])\s+\S|"
+            r"(?:Chương\s+\d+|Một là|Hai là|Ba là|Bốn là|Năm là|Thứ nhất|Thứ hai|"
+            r"Về kinh tế|Về chính trị|Về văn hóa|Về xã hội|Như vậy,|Từ thực tiễn|"
+            r"Ông\s*/?\s*bà[:.,\s]|Họ\s+và\s+tên\s*:|Số\s+CCC[D:]?|Sinh\s+ngày\s*:|Ngày\s+sinh\s*:|"
+            r"Giới\s+tính\s*:|Lớp\s*:|Thuộc\s+khoa\s*:|Trình\s+độ|Khóa\s+học\s*:|Hình\s+thức|Địa\s+chỉ|Ghi\s+chú\s*:))",
             re.IGNORECASE,
         )
+        same_row_max_gap = max(1.8 * median_body_h, float(width) * 0.045)
+
         for item in line_items:
             if not blocks:
                 blk = {
@@ -1726,8 +1937,12 @@ class OCREngine:
                     "confidence": round(item["confidence"], 3),
                     "style": dict(item["style"]),
                     "_standalone": item.get("standalone_line", False),
+                    "_is_peer_row": item.get("is_peer_row", False),
                     "_last_y_norm": float(item.get("y_norm", 0.5 * (item["bbox"][1] + item["bbox"][3]))),
                     "_last_bbox": list(item["bbox"]),
+                    "_b_votes": [1 if item["style"].get("bold") else 0],
+                    "_i_votes": [1 if item["style"].get("italic") else 0],
+                    "_sizes": [float(item["style"].get("fontSizePt", 13.0))],
                 }
                 if "tableData" in item:
                     blk["tableData"] = item["tableData"]
@@ -1740,16 +1955,21 @@ class OCREngine:
             cx1, cy1, cx2, cy2 = item["bbox"]
             cur_yn = float(item.get("y_norm", 0.5 * (cy1 + cy2)))
             prev_yn = float(prev.get("_last_y_norm", 0.5 * (lpy1 + lpy2)))
-            v_gap = min(cy1 - py2, (cur_yn - prev_yn) - median_body_h)
-            prev_reached_right = px2 >= (dominant_right - col_width * 0.14)
+            v_gap = min(cy1 - lpy2, (cur_yn - prev_yn) - median_body_h)
+            # Dùng toạ độ phải của dòng cuối cùng (lpx2) thay vì union px2 của cả block
+            prev_reached_right = lpx2 >= (dominant_right - col_width * 0.14)
 
-            # 1. Gộp các mảnh rời rạc nằm trên cùng 1 hàng ngang (vertical overlap >= 50%, ví dụ: "TIN MIỀN BẮC PHÁT ĐÊM")
+            # 1. Chỉ gộp mảnh cùng hàng ngang khi khoảng cách X hẹp hơn khe cột và không phải ô độc lập / biểu mẫu
             v_ov_row = min(lpy2, cy2) - max(lpy1, cy1)
             min_h_row = max(1.0, float(min(lpy2 - lpy1, cy2 - cy1)))
             same_row_cont = (
-                (v_ov_row >= 0.50 * min_h_row or abs(cur_yn - prev_yn) < median_body_h * 0.42)
-                and cx1 >= lpx2 - 35
-                and (cx1 - lpx2) <= width * 0.22
+                not prev.get("_standalone", False)
+                and not item.get("standalone_line", False)
+                and not prev.get("_is_peer_row", False)
+                and not item.get("is_peer_row", False)
+                and (v_ov_row >= 0.50 * min_h_row or abs(cur_yn - prev_yn) < median_body_h * 0.42)
+                and cx1 >= lpx2 - 25
+                and (cx1 - lpx2) <= same_row_max_gap
                 and "tableData" not in prev
                 and "tableData" not in item
             )
@@ -1761,15 +1981,35 @@ class OCREngine:
                 prev["_last_bbox"] = [min(lpx1, cx1), min(lpy1, cy1), max(lpx2, cx2), max(lpy2, cy2)]
                 continue
 
-            # 2. Kiểm tra trường hợp tiêu đề dài (ví dụ 1.2.3..., 3.3..., hoặc tiêu đề IN HOA) tràn sang dòng thứ 2
+            # 2. Kiểm tra tiêu đề dài bị tràn dòng (giữ tách khi độ rộng/cỡ chữ khác biệt lớn hoặc dòng sau là tiêu đề độc lập)
+            prev_w_hd = max(1.0, float(lpx2 - lpx1))
+            cur_w_hd = max(1.0, float(cx2 - cx1))
+            prev_h_hd = max(1.0, float(lpy2 - lpy1))
+            cur_h_hd = max(1.0, float(cy2 - cy1))
+            cur_pt_hd = float(item["style"].get("fontSizePt", 14.0))
+            prev_pt_hd = float(prev["style"].get("fontSizePt", 14.0))
+            cur_is_standalone_doc_title = any(kw in item["text"].upper() for kw in _STANDALONE_TITLE_WORDS) and cur_w_hd < prev_w_hd * 0.65
+
             is_wrapped_heading_cont = False
             if (
                 prev["type"] == "heading"
+                and item["type"] == "heading"
                 and not prev.get("_standalone", False)
+                and not item.get("standalone_line", False)
+                and not prev.get("_is_peer_row", False)
+                and not item.get("is_peer_row", False)
                 and v_gap <= median_body_h * 0.90
                 and not bool(new_para_prefix.match(item["text"]))
+                and not cur_is_standalone_doc_title
+                and abs(prev_pt_hd - cur_pt_hd) < 1.0
+                and abs(prev_h_hd - cur_h_hd) <= 0.28 * max(prev_h_hd, cur_h_hd)
             ):
-                if prev["text"].isupper() and item["text"].isupper() and prev["style"].get("textAlign") == "center":
+                if (
+                    prev["text"].isupper()
+                    and item["text"].isupper()
+                    and prev["style"].get("textAlign") == "center"
+                    and min(prev_w_hd, cur_w_hd) >= 0.45 * max(prev_w_hd, cur_w_hd)
+                ):
                     is_wrapped_heading_cont = True
                 elif (
                     prev_reached_right
@@ -1792,8 +2032,11 @@ class OCREngine:
                 or prev["type"] != "paragraph"
                 or prev.get("_standalone", False)
                 or item.get("standalone_line", False)
+                or prev.get("_is_peer_row", False)
+                or item.get("is_peer_row", False)
                 or item["is_indented"]
                 or bool(new_para_prefix.match(item["text"]))
+                or (bool(new_para_prefix.match(prev["text"])) and not prev_reached_right)
                 or prev["style"].get("textAlign") in ("center", "right")
                 or item["style"].get("textAlign") in ("center", "right")
                 or not prev_reached_right
@@ -1819,6 +2062,7 @@ class OCREngine:
                     "confidence": round(item["confidence"], 3),
                     "style": dict(item["style"]),
                     "_standalone": item.get("standalone_line", False),
+                    "_is_peer_row": item.get("is_peer_row", False),
                     "_last_y_norm": cur_yn,
                     "_last_bbox": list(item["bbox"]),
                     "_b_votes": [1 if item["style"].get("bold") else 0],
@@ -1835,6 +2079,7 @@ class OCREngine:
             sizes_blk = blk.pop("_sizes", [])
             blk.pop("_last_y_norm", None)
             blk.pop("_last_bbox", None)
+            blk.pop("_is_peer_row", None)
             if len(b_votes) >= 2 and blk.get("type") == "paragraph":
                 if sum(b_votes) / len(b_votes) >= 0.55:
                     blk["style"]["bold"] = True
@@ -1862,6 +2107,31 @@ class OCREngine:
                 for b in blocks:
                     if b.get("type") == "paragraph" and "style" in b:
                         b["style"]["fontFamily"] = dom_font
+
+        # Chuẩn hóa thứ tự đọc trái→phải trong cùng 1 hàng ngang nhiều cột trước khi đánh số order
+        try:
+            from export_layout import group_blocks_into_rows
+        except ImportError:
+            try:
+                from worker.export_layout import group_blocks_into_rows
+            except ImportError:
+                group_blocks_into_rows = None
+        if group_blocks_into_rows is not None and len(blocks) > 1:
+            _, ordered_rows = group_blocks_into_rows(blocks, width, height)
+            flattened_rows = [blk for row in ordered_rows for blk in row]
+            if len(flattened_rows) == len(blocks):
+                blocks = flattened_rows
+
+        # Bảo đảm bbox & order hợp lệ 100% với LayoutValidator.java của Backend
+        for order_idx, blk in enumerate(blocks, start=1):
+            blk["order"] = order_idx
+            bx1, by1, bx2, by2 = blk["bbox"]
+            bx1 = max(0, min(int(round(bx1)), width - 1))
+            by1 = max(0, min(int(round(by1)), height - 1))
+            bx2 = max(bx1, min(int(round(bx2)), width))
+            by2 = max(by1, min(int(round(by2)), height))
+            blk["bbox"] = [bx1, by1, bx2, by2]
+            blk["confidence"] = round(max(0.0, min(1.0, float(blk.get("confidence", 0.9)))), 3)
 
         if not blocks:
             # Nếu không tìm thấy chữ nào

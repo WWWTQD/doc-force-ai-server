@@ -86,6 +86,8 @@ def _clean_gemini_state(monkeypatch: pytest.MonkeyPatch) -> None:
         "LLM_VISION_MODEL",
         "LLM_FALLBACK_MODEL",
         "LLM_FALLBACK_ON_UNAVAILABLE",
+        "LLM_REQUEST_TIMEOUT_SECONDS",
+        "LLM_PAGE_DEADLINE_SECONDS",
         "LLM_MAX_VLM_CROPS",
     ):
         monkeypatch.delenv(var, raising=False)
@@ -159,7 +161,7 @@ def test_gemini_text_and_batched_vlm_success_and_logs_private(
     vlm_line = "Công văn s: 20/CV-"
 
     def handler(model: str, contents: Any, config: Any, idx: int) -> Any:
-        assert model == "gemini-3.5-flash"
+        assert model == "gemini-3.5-flash-lite"
         assert config.temperature == 0.0
         assert config.response_mime_type == "application/json"
         assert config.http_options.timeout >= 500
@@ -244,8 +246,8 @@ def test_gemini_text_and_batched_vlm_success_and_logs_private(
     meta = out["postprocessMeta"]
     assert meta["status"] == "COMPLETED"
     assert meta["provider"] == "gemini"
-    assert meta["llmModel"] == "gemini-3.5-flash"
-    assert meta["vlmModel"] == "gemini-3.5-flash"
+    assert meta["llmModel"] == "gemini-3.5-flash-lite"
+    assert meta["vlmModel"] == "gemini-3.5-flash-lite"
     assert meta["cloudTier"] == "free"
     assert meta["llmCalls"] == 1
     assert meta["vlmCalls"] == 1
@@ -420,6 +422,8 @@ def test_gemini_429_breaker_401_404_and_consent_privacy_matrix(
     ctrl_fb = LLMResilienceController()
     p_fb = GeminiProvider(
         api_key=DUMMY_KEY,
+        text_model="gemini-3.5-flash",
+        fallback_model="gemini-3.5-flash-lite",
         cloud_consent=True,
         sdk_client=_FakeSDKClient(fb_handler),
         controller=ctrl_fb,
@@ -452,7 +456,13 @@ def test_gemini_429_breaker_401_404_and_consent_privacy_matrix(
         )
     )
     p_404 = GeminiProvider(
-        api_key=DUMMY_KEY, cloud_consent=True, sdk_client=sdk_404, controller=ctrl_404, cache=InMemoryLRUCache(16)
+        api_key=DUMMY_KEY,
+        text_model="gemini-3.5-flash",
+        fallback_model="gemini-3.5-flash-lite",
+        cloud_consent=True,
+        sdk_client=sdk_404,
+        controller=ctrl_404,
+        cache=InMemoryLRUCache(16),
     )
     out_404_a = process_page(layout, options={"llmPostprocess": True}, config=_gem_cfg(), llm_client=p_404)
     out_404_b = process_page(layout, options={"llmPostprocess": True}, config=_gem_cfg(), llm_client=p_404)
@@ -517,6 +527,9 @@ def test_gemini_timeout_retry_deadline_thinking_fallback_and_cache(
 
     p_to = GeminiProvider(
         api_key=DUMMY_KEY,
+        text_model="gemini-3.5-flash",
+        fallback_model=None,
+        fallback_on_unavailable=False,
         cloud_consent=True,
         sdk_client=_FakeSDKClient(timeout_always),
         controller=LLMResilienceController(clock=clk1.time, sleep_fn=clk1.sleep),
@@ -524,7 +537,10 @@ def test_gemini_timeout_retry_deadline_thinking_fallback_and_cache(
         clock=clk1.time,
     )
     out_to_retry = process_page(
-        layout, options={"llmPostprocess": True}, config=_gem_cfg(page_deadline_seconds=15.0), llm_client=p_to
+        layout,
+        options={"llmPostprocess": True},
+        config=_gem_cfg(page_deadline_seconds=15.0, fallback_on_unavailable=False),
+        llm_client=p_to,
     )
     assert len(p_to._sdk_client.models.calls) == 2
     assert out_to_retry["postprocessMeta"]["status"] == "FAILED_SAFE"
@@ -601,10 +617,9 @@ def test_gemini_timeout_retry_deadline_thinking_fallback_and_cache(
     assert out_t2["postprocessMeta"]["status"] == "COMPLETED"
     assert thinking_seen == [True, False, False]
 
-    # Env aliases: LLM_MODEL, LLM_POSTPROCESS_DEFAULT, LLM_FALLBACK_ON_UNAVAILABLE
+    # Env aliases & new defaults: LLM_MODEL, LLM_POSTPROCESS_DEFAULT, multi-cluster fallback, 28s/90s timeouts
     monkeypatch.setenv("LLM_MODEL", "gemini-3.5-flash")
     monkeypatch.setenv("LLM_POSTPROCESS_DEFAULT", "true")
-    monkeypatch.setenv("LLM_FALLBACK_ON_UNAVAILABLE", "true")
     monkeypatch.delenv("LLM_POSTPROCESS_ENABLED", raising=False)
     monkeypatch.delenv("LLM_TEXT_MODEL", raising=False)
     monkeypatch.delenv("LLM_VISION_MODEL", raising=False)
@@ -612,8 +627,13 @@ def test_gemini_timeout_retry_deadline_thinking_fallback_and_cache(
     assert cfg_alias.enabled is True
     assert cfg_alias.text_model == "gemini-3.5-flash"
     assert cfg_alias.vision_model == "gemini-3.5-flash"
-    assert cfg_alias.fallback_model == "gemini-3.5-flash-lite"
+    assert (
+        cfg_alias.fallback_model
+        == "gemini-3.1-flash-lite,gemini-3.5-flash,gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash"
+    )
     assert cfg_alias.fallback_on_unavailable is True
+    assert cfg_alias.request_timeout_seconds == 28.0
+    assert cfg_alias.page_deadline_seconds == 90.0
 
     # Opt-in fallback_on_unavailable=True switches primary -> fallback on 504/503/timeout and remembers it
     unavail_models: list[str] = []
@@ -723,3 +743,114 @@ def test_gemini_timeout_retry_deadline_thinking_fallback_and_cache(
     # Heavy ML packages must remain unimported
     for mod in ("torch", "paddle", "paddleocr", "vietocr", "ultralytics"):
         assert mod not in sys.modules
+
+
+def test_gemini_cross_cluster_fallback_and_404_after_503_non_fatal() -> None:
+    layout = _make_layout(["Thi hn np đon ngày 06/01/2021"])
+
+    # 1. Default chain switches 3.x (503/504) -> gemini-2.5-flash (200 OK)
+    seen_models: list[str] = []
+
+    def cross_cluster_handler(model: str, _c: Any, _cfg: Any, _idx: int) -> Any:
+        seen_models.append(model)
+        if model in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash"):
+            raise genai_errors.ServerError(
+                503, {"error": {"code": 503, "status": "UNAVAILABLE", "message": "busy"}}
+            )
+        assert model == "gemini-2.5-flash"
+        return _FakeResponse(
+            json.dumps(
+                {
+                    "lines": [
+                        {
+                            "lineId": "gem-b-1",
+                            "corrected": "Thời hạn nộp đơn ngày ⟦T1⟧",
+                            "confidence": 0.96,
+                            "changes": [],
+                        }
+                    ]
+                }
+            )
+        )
+
+    p_cross = GeminiProvider(
+        api_key=DUMMY_KEY,
+        cloud_consent=True,
+        sdk_client=_FakeSDKClient(cross_cluster_handler),
+        controller=LLMResilienceController(),
+        cache=InMemoryLRUCache(16),
+    )
+    assert p_cross.request_timeout_seconds == 28.0
+    assert p_cross.fallback_on_unavailable is True
+    out_cross = process_page(
+        layout,
+        options={"llmPostprocess": True},
+        config=PostprocessConfig(enabled=True, provider="gemini", cloud_consent=True),
+        llm_client=p_cross,
+    )
+    assert out_cross["postprocessMeta"]["status"] == "COMPLETED"
+    assert out_cross["postprocessMeta"]["llmModel"] == "gemini-2.5-flash"
+    assert seen_models == [
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-2.5-flash",
+    ]
+
+    # 2. 3.x transient 503 followed by 404 on 2.5/2.0 -> FAILED_SAFE (NOT permanent MODEL_UNAVAILABLE)
+    #    and next call skips known-404 models and succeeds when 3.5-flash-lite recovers!
+    phase = {"step": 1}
+    calls_phase: list[str] = []
+
+    def mixed_handler(model: str, _c: Any, _cfg: Any, _idx: int) -> Any:
+        calls_phase.append(model)
+        if phase["step"] == 1:
+            if model.startswith("gemini-3"):
+                raise genai_errors.ServerError(
+                    503, {"error": {"code": 503, "status": "UNAVAILABLE", "message": "spike"}}
+                )
+            raise genai_errors.ClientError(
+                404, {"error": {"code": 404, "status": "NOT_FOUND", "message": "deprecated"}}
+            )
+        return _FakeResponse(
+            json.dumps(
+                {
+                    "lines": [
+                        {
+                            "lineId": "gem-b-1",
+                            "corrected": "Thời hạn nộp đơn ngày ⟦T1⟧",
+                            "confidence": 0.95,
+                            "changes": [],
+                        }
+                    ]
+                }
+            )
+        )
+
+    ctrl_mix = LLMResilienceController()
+    p_mix = GeminiProvider(
+        api_key=DUMMY_KEY,
+        cloud_consent=True,
+        sdk_client=_FakeSDKClient(mixed_handler),
+        controller=ctrl_mix,
+        cache=InMemoryLRUCache(16),
+    )
+    out_fail = process_page(
+        layout,
+        options={"llmPostprocess": True},
+        config=PostprocessConfig(enabled=True, provider="gemini", cloud_consent=True),
+        llm_client=p_mix,
+    )
+    assert out_fail["postprocessMeta"]["status"] == "FAILED_SAFE"
+    assert ctrl_mix.disabled_reason is None
+    assert ctrl_mix.is_model_unavailable("gemini-2.5-flash")
+
+    phase["step"] = 2
+    out_rec = process_page(
+        layout,
+        options={"llmPostprocess": True},
+        config=PostprocessConfig(enabled=True, provider="gemini", cloud_consent=True),
+        llm_client=p_mix,
+    )
+    assert out_rec["postprocessMeta"]["status"] == "COMPLETED"
+    assert out_rec["postprocessMeta"]["llmModel"] == "gemini-3.5-flash-lite"
