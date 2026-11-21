@@ -207,15 +207,23 @@ class RestorationService:
             soft_norm, bg_safe = precomputed_soft_norm
         else:
             soft_norm, bg_safe = prep.soft_normalize_luma(clean_bgr, mode="dilate")
-        stroke_conf, local_drop, _ = prep.compute_stroke_protection(soft_norm, h, w)
+        gray_f = gray_orig.astype(np.float32)
+        raw_norm = np.clip((gray_f / bg_safe) * 255.0, 0.0, 255.0)
+        bleed_severity = prep.estimate_page_bleed_severity(raw_norm)
+        stroke_conf, local_drop, _ = prep.compute_stroke_protection(
+            soft_norm, h, w, bleed_severity=bleed_severity
+        )
 
         u_f = y_unet.astype(np.float32) / 255.0
         s_f = soft_norm / 255.0
-        gray_f = gray_orig.astype(np.float32)
 
         # Prevent U-Net from re-darkening multi-line highlighter bands or suppressed bleed-through ghosts
-        # where soft_norm is already bright (>= 200) and local high-frequency stroke drop is low (< 16).
-        u_f = np.where((soft_norm >= 200.0) & (local_drop < 16.0), np.maximum(u_f, s_f), u_f)
+        # where soft_norm is already bright (>= 200) and edge-aware stroke signal is absent.
+        u_f = np.where(
+            (soft_norm >= 200.0) & (local_drop < 14.0) & (stroke_conf < 0.05),
+            np.maximum(u_f, s_f),
+            u_f,
+        )
 
         # 1. U-Net dominant background restoration (82% U-Net + 18% native soft-normalized reflectance).
         bg_mix = 0.82 * u_f + 0.18 * s_f
@@ -223,21 +231,36 @@ class RestorationService:
         non_stroke_w = np.clip((0.28 - stroke_conf) / 0.28, 0.0, 1.0)
         bg_evidence = bg_mix + non_stroke_w * np.maximum(0.0, soft_paper_floor - bg_mix)
 
-        # Smooth quadratic lift in [0.76, 0.91] to pure white (no cliff-edge blotching)
-        lift_t = np.clip((bg_evidence - 0.76) / 0.15, 0.0, 1.0)
+        # Smooth quadratic lift to pure white (gentler threshold on clean pages: Do No Harm)
+        lift_lo = 0.84 - 0.08 * bleed_severity
+        lift_span = 0.11 + 0.04 * bleed_severity
+        lift_t = np.clip((bg_evidence - lift_lo) / lift_span, 0.0, 1.0)
         y_unet_bg_cleaned = bg_evidence + (lift_t * lift_t) * (1.0 - bg_evidence)
-        y_unet_bg_cleaned = np.where(u_f >= 0.93, np.maximum(y_unet_bg_cleaned, 0.99), y_unet_bg_cleaned)
+        y_unet_bg_cleaned = np.where(
+            (u_f >= 0.93) & (stroke_conf < 0.05) & (local_drop < 12.0),
+            np.maximum(y_unet_bg_cleaned, 0.99),
+            y_unet_bg_cleaned,
+        )
 
         # 2. High-Frequency Native Pixel Preservation at all strokes & stroke-edge transition boundaries
         grad_x = cv2.Sobel(soft_norm, cv2.CV_32F, 1, 0, ksize=3)
         grad_y = cv2.Sobel(soft_norm, cv2.CV_32F, 0, 1, ksize=3)
         grad_mag = np.hypot(grad_x, grad_y)
-        # Edge transition band around character boundaries (excluded where U-Net or soft_norm says pure background)
+        # Edge transition band around character boundaries; crisp light-gray strokes on clean pages
+        # are preserved even when downscaled U-Net misses 1-2px thin glyphs (e.g. '/', ':', '-').
+        unet_bg_veto = np.clip((0.97 - u_f) / 0.12, 0.0, 1.0)
+        crisp_override = (
+            (1.0 - 0.85 * bleed_severity)
+            * np.clip((grad_mag - 45.0) / 55.0, 0.0, 1.0)
+            * np.clip((local_drop - 14.0) / 10.0, 0.0, 1.0)
+        )
+        edge_gate = np.maximum(unet_bg_veto, crisp_override)
+        upper_soft = 234.0 - 16.0 * bleed_severity
         edge_band = (
             np.clip((grad_mag - 24.0) / 50.0, 0.0, 1.0)
             * np.clip((local_drop - 8.0) / 14.0, 0.0, 1.0)
-            * np.clip((0.97 - u_f) / 0.12, 0.0, 1.0)
-            * np.clip((218.0 - soft_norm) / 28.0, 0.0, 1.0)
+            * edge_gate
+            * np.clip((upper_soft - soft_norm) / 28.0, 0.0, 1.0)
         )
 
         if max(h, w) < 900:
@@ -255,8 +278,9 @@ class RestorationService:
         hf_soft = soft_norm - cv2.GaussianBlur(soft_norm, (0, 0), sigmaX=0.9)
         hf_detail = 0.60 * hf_soft + 0.40 * hf_orig
 
-        s_dark = np.power(np.clip(s_f / 0.96, 0.0, 1.0), 1.65) * 255.0
-        s_dark = np.minimum(s_dark, np.clip(soft_norm - 0.55 * local_drop, 0.0, 255.0))
+        s_dark = np.power(np.clip(s_f / 0.96, 0.0, 1.0), 1.80) * 255.0
+        drop_pull = np.where(stroke_conf >= 0.35, 0.72, 0.55)
+        s_dark = np.minimum(s_dark, np.clip(soft_norm - drop_pull * local_drop, 0.0, 255.0))
         # Only pull down toward raw gray_f when local background is normal bright paper (bg_safe >= 190),
         # never inside a darker highlighter band where gray_f has a constant dye offset.
         s_dark = np.where(
@@ -287,7 +311,7 @@ class RestorationService:
     ) -> np.ndarray:
         """
         Runs U-Net v5.1 (U-Net-Dominant + Non-Destructive Stroke Envelope) restoration on an image (BGR uint8):
-        1. Pre-cleans genuine vivid blue/red/purple pen handwriting & adjacent book gutter via `clean_handwriting_and_book_gutter()`.
+        1. Pre-cleans only outer book gutter (< 4% width) via `clean_handwriting_and_book_gutter(remove_colored_pen=False)`.
         2. Upscales small images (`max(h, w) < 900`) by 1.5x-2.0x (`INTER_LANCZOS4`) before DocumentRestorationUNet
            to prevent erasing thin strokes, or uses `working_max_side = 768` on CPU for large scans (> 1000px)
            for fast ~10-13s U-Net inference while preserving 1:1 native sharpness at full `(orig_h, orig_w)`.
@@ -316,9 +340,9 @@ class RestorationService:
             t0 = time.perf_counter()
             prep = self._get_preprocessor()
 
-            # Step 1: Remove interfering blue/purple/red pen handwriting & adjacent book gutter
+            # Step 1: Only clean extreme outer book gutter (< 4% width); preserve red stamps & signatures
             if not pre_cleaned and bgr_input.ndim == 3:
-                clean_bgr = prep.clean_handwriting_and_book_gutter(bgr_input)
+                clean_bgr = prep.clean_handwriting_and_book_gutter(bgr_input, remove_colored_pen=False)
             else:
                 clean_bgr = bgr_input
 
@@ -401,7 +425,7 @@ class RestorationService:
             if not keep_color:
                 return cv2.cvtColor(y_clean, cv2.COLOR_GRAY2BGR)
 
-            # Preserve genuine vivid colored ink (red stamps, signatures) without re-introducing yellow paper tint
+            # Preserve genuine vivid colored ink (red stamps, blue signatures) without re-introducing yellow paper tint
             ycrcb = cv2.cvtColor(clean_bgr, cv2.COLOR_BGR2YCrCb)
             _, cr_chan, cb_chan = cv2.split(ycrcb)
             cr_f = cr_chan.astype(np.float32)
@@ -411,10 +435,21 @@ class RestorationService:
             cb_bg = cv2.GaussianBlur(cb_f, (0, 0), sigmaX=max(11.0, min(orig_h, orig_w) * 0.03))
             chroma_rel = np.hypot(cr_f - cr_bg, cb_f - cb_bg)
             chroma_sat = np.hypot(cr_f - 128.0, cb_f - 128.0)
-            color_fg_mask = (y_clean < 215) & (chroma_sat > 28.0) & (chroma_rel > 22.0)
+            is_vivid_color = (chroma_sat > 24.0) & (chroma_rel > 18.0)
+            is_blue_pen_color = (cb_f - cr_f > 6.0) & (chroma_sat > 10.5) & (chroma_rel > 10.5) & (y_clean < 215)
+            color_fg_mask = (y_clean < 228) & (is_vivid_color | is_blue_pen_color)
+            # Keep natural luminance on colored stamps/signatures so red stays vivid crimson while
+            # overlapping neutral black text (e.g. "TS. Huỳnh Hữu Hưng") stays deep black.
+            y_color_nat = np.clip(soft_norm_full * 0.90, 85.0, 212.0)
+            y_out_final = np.where(
+                color_fg_mask,
+                np.maximum(y_clean.astype(np.float32), y_color_nat),
+                y_clean.astype(np.float32),
+            )
+            y_final_u8 = np.clip(y_out_final, 0.0, 255.0).astype(np.uint8)
             cr_clean = np.where(color_fg_mask, cr_chan, 128).astype(np.uint8)
             cb_clean = np.where(color_fg_mask, cb_chan, 128).astype(np.uint8)
-            return cv2.cvtColor(cv2.merge([y_clean, cr_clean, cb_clean]), cv2.COLOR_YCrCb2BGR)
+            return cv2.cvtColor(cv2.merge([y_final_u8, cr_clean, cb_clean]), cv2.COLOR_YCrCb2BGR)
 
         except Exception as ex:
             logger.warning("[RestorationService] Restoration inference exception: %s. Using original.", ex)

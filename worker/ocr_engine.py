@@ -19,6 +19,30 @@ except ImportError:
     def is_gibberish_or_handwriting_text(t: str) -> bool:
         return not bool(t and t.strip())
 
+try:
+    from vietnamese_syllable_validator import check_syllable as _check_vi_syllable
+except ImportError:
+    try:
+        from worker.vietnamese_syllable_validator import check_syllable as _check_vi_syllable
+    except ImportError:
+        _check_vi_syllable = None
+
+try:
+    from ocr_confidence import recognize_with_probs as _recognize_vietocr_with_probs
+except ImportError:
+    try:
+        from worker.ocr_confidence import recognize_with_probs as _recognize_vietocr_with_probs
+    except ImportError:
+        _recognize_vietocr_with_probs = None
+
+try:
+    from preprocessor import ImagePreprocessor as _OrientPreprocessor
+except ImportError:
+    try:
+        from worker.preprocessor import ImagePreprocessor as _OrientPreprocessor
+    except ImportError:
+        _OrientPreprocessor = None
+
 # Đặt KMP_DUPLICATE_LIB_OK và import torch trước paddle để tránh xung đột OpenMP DLL trên Windows
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 try:
@@ -447,73 +471,361 @@ class OCREngine:
         return (self.ocr_instance is not None) or (self.orient_model is not None)
 
     @staticmethod
-    def _vi_syllable_validity_score(texts: list[str]) -> float:
+    def _prepare_contrast_normalized_gray(img: np.ndarray, max_side: int = 1400) -> np.ndarray:
         """
-        Đánh giá độ hợp lệ ngữ âm tiếng Việt thuần tuý (không dùng danh sách từ cố định):
-          - Kiểm tra tỷ lệ âm tiết ghép đúng nguyên âm + vần cuối tiếng Việt
-          - Phạt chuỗi ký tự vô nghĩa khi ảnh bị lộn ngược (quá nhiều chữ hoa rời rạc hoặc phụ âm không hợp lệ).
+        Chuẩn hóa chiếu sáng và độ tương phản cục bộ cho giấy ố vàng / bóng đổ trước khi đưa vào
+        DocumentOrientationResNet để phân bố mực/nền khớp với miền dữ liệu huấn luyện.
         """
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        h, w = gray.shape[:2]
+        scale = min(1.0, float(max_side) / float(max(1, max(h, w))))
+        g_work = (
+            cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            if scale < 1.0
+            else gray
+        )
+        k_bg = max(21, min(51, (min(g_work.shape[:2]) // 18) | 1))
+        bg = cv2.dilate(g_work, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_bg, k_bg)))
+        bg = cv2.medianBlur(bg, min(k_bg, 21) | 1)
+        return np.clip((g_work.astype(np.float32) / np.maximum(bg.astype(np.float32), 35.0)) * 238.0, 0.0, 255.0).astype(np.uint8)
+
+    @staticmethod
+    def _prepare_clean_ocr_work_img(img: np.ndarray, max_side: int = 1280) -> tuple[np.ndarray, float]:
+        """Thu nhỏ tối đa về `max_side` và khử nền ố/thấu mực nhẹ phục vụ kiểm chứng nhanh DBNet + VietOCR."""
+        h, w = img.shape[:2]
+        scale = min(1.0, float(max_side) / float(max(1, max(h, w))))
+        small = (
+            cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            if scale < 1.0
+            else img
+        )
+        if _OrientPreprocessor is not None:
+            try:
+                soft_norm, _ = _OrientPreprocessor.soft_normalize_luma(small, mode="dilate")
+                norm_u8 = np.clip(soft_norm, 0.0, 255.0).astype(np.uint8)
+                return cv2.cvtColor(norm_u8, cv2.COLOR_GRAY2BGR), scale
+            except Exception:
+                pass
+        return small, scale
+
+    def _detect_boxes_fast(self, img: np.ndarray, max_side: int = 1100) -> tuple[np.ndarray, list[np.ndarray]]:
+        """Chạy nhanh DBNet text_detector trên bản ảnh đã chuẩn hóa chiếu sáng và trả về (work_img, boxes)."""
+        sig = (
+            img.shape,
+            max_side,
+            round(float(img[::29, ::29].mean()), 4),
+            img[0, 0].tobytes() if img.size else b"",
+            img[-1, -1].tobytes() if img.size else b"",
+        )
+        cached = getattr(self, "_fast_boxes_cache", None)
+        if cached is not None and cached[0] == sig:
+            return cached[1], cached[2]
+
+        work_img, _ = self._prepare_clean_ocr_work_img(img, max_side=max_side)
+        if self.ocr_instance is None:
+            return work_img, []
+        dt_boxes, _ = self.ocr_instance.text_detector(work_img)
+        if dt_boxes is None or len(dt_boxes) == 0:
+            boxes: list[np.ndarray] = []
+        else:
+            boxes = [_order_poly(b) for b in dt_boxes]
+        self._fast_boxes_cache = (sig, work_img, boxes)
+        return work_img, boxes
+
+    def detect_text_axis(self, img: np.ndarray) -> str:
+        """
+        Xác định trục chữ chính trên trang ('horizontal' | 'vertical' | 'ambiguous')
+        dựa trên tỷ lệ khung chữ (w vs h) từ detector thay vì chỉ dựa vào tỷ lệ khung ảnh.
+        """
+        if self.ocr_instance is None:
+            return "ambiguous"
+        try:
+            _, boxes = self._detect_boxes_fast(img, max_side=1100)
+            aspects: list[float] = []
+            horiz_cnt = 0
+            vert_cnt = 0
+            for pts in boxes:
+                bw = float(max(pts[:, 0]) - min(pts[:, 0]))
+                bh = float(max(pts[:, 1]) - min(pts[:, 1]))
+                if max(bw, bh) < 18.0:
+                    continue
+                aspects.append(bw / max(1.0, bh))
+                if bw > bh * 1.35:
+                    horiz_cnt += 1
+                elif bh > bw * 1.35:
+                    vert_cnt += 1
+            total = len(aspects)
+            if total >= 3:
+                med_asp = float(np.median(aspects))
+                if vert_cnt / total >= 0.60 and med_asp < 0.85:
+                    return "vertical"
+                if horiz_cnt / total >= 0.60 and med_asp > 1.25:
+                    return "horizontal"
+        except Exception as exc:
+            LOG.debug("detect_text_axis lỗi: %s", exc)
+        return "ambiguous"
+
+    @staticmethod
+    def _slice_wide_line_crop(crop: np.ndarray, max_aspect: float = 14.0) -> np.ndarray:
+        """Nếu dòng chữ quá dài (> 14:1), trích đoạn rộng <= 14*ch đậm nét nhất để tránh VietOCR seq2seq lặp từ."""
+        ch, cw = crop.shape[:2]
+        max_w = int(round(max(1, ch) * max_aspect))
+        if cw <= max_w:
+            return crop
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+        inv = 255.0 - gray.astype(np.float32)
+        col_energy = inv.mean(axis=0)
+        # Quét cửa sổ rộng max_w tìm đoạn giàu nét mực (tránh lề trắng) và ưu tiên gần giữa
+        csum = np.concatenate([[0.0], np.cumsum(col_energy)])
+        starts = np.arange(0, cw - max_w + 1, max(4, max_w // 12))
+        if len(starts) == 0:
+            return crop[:, :max_w]
+        energies = csum[starts + max_w] - csum[starts]
+        best_s = int(starts[int(np.argmax(energies))])
+        return crop[:, best_s : best_s + max_w]
+
+    def _extract_readability_line_crops(self, img: np.ndarray, max_lines: int = 5) -> list[np.ndarray]:
+        """
+        Trích 4-5 dòng chữ đơn tiêu biểu trải đều từ trên xuống dưới bằng detector
+        để phục vụ Tầng 2 (OCR Readability Gate).
+        """
+        work_img, boxes = self._detect_boxes_fast(img, max_side=1100)
+        if not boxes:
+            return []
+        ih, iw = work_img.shape[:2]
+
+        cands: list[tuple[float, float, float, np.ndarray]] = []
+        for pts in boxes:
+            bw = float(max(pts[:, 0]) - min(pts[:, 0]))
+            bh = float(max(pts[:, 1]) - min(pts[:, 1]))
+            ym = float(np.mean(pts[:, 1]))
+            if bw > iw * 0.12 and 10.0 <= bh <= ih * 0.09 and bw > bh * 2.2:
+                if ih * 0.04 <= ym <= ih * 0.96:
+                    cands.append((ym, bw, bh, pts))
+        if not cands:
+            return []
+
+        base_h = float(
+            np.clip(
+                np.percentile([c[2] for c in cands], 25),
+                max(10.0, ih * 0.012),
+                max(42.0, ih * 0.038),
+            )
+        )
+        single_cands = [c for c in cands if c[2] <= base_h * 1.48]
+
+        chosen_crops: list[np.ndarray] = []
+        if len(single_cands) >= 3:
+            single_cands.sort(key=lambda c: c[0])
+            pick_n = min(max_lines, len(single_cands))
+            step = len(single_cands) / float(pick_n)
+            for idx in range(pick_n):
+                lo = int(idx * step)
+                hi = max(lo + 1, int((idx + 1) * step))
+                band = single_cands[lo:hi]
+                best = max(band, key=lambda c: c[1])
+                crop = _rotate_crop(work_img, best[3])
+                if crop is not None and crop.size > 0:
+                    chosen_crops.append(self._slice_wide_line_crop(crop))
+        else:
+            # Nếu detector gộp 2-3 dòng sát nhau -> tách theo khe thưa mực ngang thành từng dòng đơn
+            cands.sort(key=lambda c: c[1], reverse=True)
+            for _, _, bh, pts in cands[: max_lines + 2]:
+                crop = _rotate_crop(work_img, pts)
+                if crop is None or crop.size == 0:
+                    continue
+                ch, cw = crop.shape[:2]
+                if ch > base_h * 1.45:
+                    n_split = max(2, min(4, int(round(ch / base_h))))
+                    line_step = ch / float(n_split)
+                    for s_i in range(n_split):
+                        y0 = max(0, int(s_i * line_step) - 2)
+                        y1 = min(ch, int((s_i + 1) * line_step) + 2)
+                        sub = crop[y0:y1, :]
+                        if sub.shape[0] >= 12:
+                            chosen_crops.append(self._slice_wide_line_crop(sub))
+                        if len(chosen_crops) >= max_lines:
+                            break
+                else:
+                    chosen_crops.append(self._slice_wide_line_crop(crop))
+                if len(chosen_crops) >= max_lines:
+                    break
+        return chosen_crops[:max_lines]
+
+    @staticmethod
+    def _line_repetition_penalty(tokens: list[str]) -> float:
+        """Phạt nặng hiện tượng VietOCR seq2seq lặp vô hạn (ví dụ 'THỊ THỊ THỊ...') hoặc chuỗi số rác khi chữ ngược."""
+        if not tokens:
+            return 0.0
+        lows = [t.lower() for t in tokens]
+        max_run = 1
+        cur = 1
+        for i in range(1, len(lows)):
+            cur = cur + 1 if lows[i] == lows[i - 1] else 1
+            if cur > max_run:
+                max_run = cur
+        if max_run >= 3:
+            return 0.25
+        if len(lows) >= 5 and (len(set(lows)) / len(lows)) < 0.48:
+            return 0.25
+        if len(lows) >= 6:
+            bigrams = [(lows[i], lows[i + 1]) for i in range(len(lows) - 1)]
+            if (len(set(bigrams)) / len(bigrams)) < 0.50:
+                return 0.25
+        digit_only_chars = sum(len(t) for t in tokens if t.isdigit() and len(t) >= 8)
+        total_chars = sum(len(t) for t in tokens)
+        if total_chars > 0 and (digit_only_chars / total_chars) > 0.65:
+            return 0.25
+        return 1.0
+
+    def _evaluate_crops_readability(self, crops: list[np.ndarray]) -> dict:
+        """
+        Chấm điểm đọc hiểu (OCR Readability) cho danh sách crop dòng chữ bằng VietOCR + VietnameseSyllableValidator.
+        Trả về dict gồm `read_score`, `valid_vi_ratio`, `mean_conf`, `texts`.
+        """
+        if not crops:
+            return {"read_score": 0.0, "valid_vi_ratio": 0.0, "mean_conf": 0.0, "texts": []}
+
         import unicodedata
 
-        joined = unicodedata.normalize("NFC", " ".join((t or "").strip() for t in texts))
-        if len(joined) < 4:
-            return 0.0
-        tokens = [tok.strip(".,;:!?\"'()[]{}-–—") for tok in joined.split()]
-        alpha_tokens = [tok for tok in tokens if len(tok) >= 2 and any(ch.isalpha() for ch in tok)]
-        if not alpha_tokens:
-            return 0.0
+        texts: list[str] = []
+        confs: list[float] = []
+        if self.viet_recognizer is not None:
+            pil_samples = []
+            for c in crops:
+                ch_c, cw_c = c.shape[:2]
+                new_w = min(960, max(32, int(round(cw_c * (32.0 / max(1, ch_c))))))
+                rs = cv2.resize(c, (new_w, 32), interpolation=cv2.INTER_AREA)
+                pil_samples.append(Image.fromarray(cv2.cvtColor(rs, cv2.COLOR_BGR2RGB)))
+            if torch is not None:
+                with torch.inference_mode():
+                    if _recognize_vietocr_with_probs is not None:
+                        texts, confs = _recognize_vietocr_with_probs(self.viet_recognizer, pil_samples, LOG)
+                    else:
+                        texts = list(self.viet_recognizer.predict_batch(pil_samples))
+                        confs = [0.85] * len(texts)
+            else:
+                if _recognize_vietocr_with_probs is not None:
+                    texts, confs = _recognize_vietocr_with_probs(self.viet_recognizer, pil_samples, LOG)
+                else:
+                    texts = list(self.viet_recognizer.predict_batch(pil_samples))
+                    confs = [0.85] * len(texts)
+        elif self.ocr_instance is not None:
+            rec_res, _ = self.ocr_instance.text_recognizer(crops)
+            for text, conf in (rec_res or []):
+                texts.append(str(text or ""))
+                confs.append(float(conf))
 
-        syllable_re = re.compile(
-            r"^(?:[bcdfghklmnpqrstvwxzđ]{0,3})"
-            r"[aàáảãạăằắẳẵặâầấẩẫậeèéẻẽẹêềếểễệiìíỉĩịoòóỏõọôồốổỗộơờớởỡợuùúủũụưừứửữựyỳýỷỹỵ]{1,3}"
-            r"(?:ch|ng|nh|c|m|n|p|t|i|o|u|y)?$"
-        )
-        vn_diacritics = set("àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ")
+        if not texts:
+            return {"read_score": 0.0, "valid_vi_ratio": 0.0, "mean_conf": 0.0, "texts": []}
+
+        valid_single_vowels = set("àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵyôơ")
+        eff_confs: list[float] = []
+        eff_vrs: list[float] = []
+        all_upper_alpha = 0
+        total_alpha_global = 0
+
+        for txt, cf in zip(texts, confs):
+            norm = unicodedata.normalize("NFC", (txt or "").strip())
+            raw_tokens = [re.sub(r"^[^\wđĐ]+|[^\wđĐ]+$", "", tok) for tok in norm.split()]
+            raw_tokens = [tok for tok in raw_tokens if tok]
+            if not raw_tokens:
+                eff_confs.append(0.0)
+                eff_vrs.append(0.0)
+                continue
+
+            rep_pen = self._line_repetition_penalty(raw_tokens)
+            line_alpha = 0
+            line_valid = 0
+            for raw_tok in raw_tokens:
+                for sub in re.split(r"[\-–—.,;:!?\"'()\[\]/]+", raw_tok):
+                    if not sub or any(ch.isdigit() for ch in sub) or not any(ch.isalpha() for ch in sub):
+                        continue
+                    low = sub.lower()
+                    if len(sub) == 1 and low not in valid_single_vowels:
+                        continue
+                    line_alpha += 1
+                    total_alpha_global += 1
+                    if len(sub) >= 2 and sub.isupper():
+                        all_upper_alpha += 1
+                    if len(sub) == 1:
+                        line_valid += 1
+                    elif _check_vi_syllable is not None:
+                        if _check_vi_syllable(sub) is None:
+                            line_valid += 1
+                    elif not any(ch in "fjwz" for ch in low) and len(low) <= 7:
+                        line_valid += 1
+
+            line_vr = (line_valid / line_alpha) if line_alpha > 0 else 0.0
+            if line_alpha >= 3 and (all_upper_alpha / max(1, total_alpha_global)) > 0.85 and line_vr < 0.72 and cf < 0.65:
+                line_vr *= 0.60
+            eff_confs.append(float(cf) * rep_pen)
+            eff_vrs.append(float(line_vr) * rep_pen)
+
+        mean_conf = float(np.mean(eff_confs)) if eff_confs else 0.0
+        valid_vi_ratio = float(np.mean(eff_vrs)) if eff_vrs else 0.0
+        read_score = float(0.55 * mean_conf + 0.45 * valid_vi_ratio)
+        return {
+            "read_score": read_score,
+            "valid_vi_ratio": valid_vi_ratio,
+            "mean_conf": mean_conf,
+            "texts": texts,
+        }
+
+    @staticmethod
+    def _vi_syllable_validity_score(texts: list[str]) -> float:
+        """Tương thích ngược: chấm điểm hợp lệ âm tiết tiếng Việt cho danh sách chuỗi."""
+        if not texts:
+            return 0.0
+        import unicodedata
+
         valid_cnt = 0
-        dia_tokens = 0
-        all_upper_cnt = 0
-        for tok in alpha_tokens:
-            low = tok.lower()
-            if tok.isupper() and len(tok) >= 2:
-                all_upper_cnt += 1
-            if any(c in vn_diacritics for c in low):
-                dia_tokens += 1
-            # Tiếng Việt không dùng f, j, w, z trong âm tiết chuẩn và không quá dài một âm tiết
-            if len(low) <= 7 and not any(c in "fjwz0123456789" for c in low) and syllable_re.match(low):
-                valid_cnt += 1
+        total_cnt = 0
+        for txt in texts:
+            norm = unicodedata.normalize("NFC", (txt or "").strip())
+            for raw_tok in norm.split():
+                for sub in re.split(r"[\-–—.,;:!?\"'()\[\]/]+", raw_tok):
+                    if len(sub) < 2 or any(ch.isdigit() for ch in sub) or not any(ch.isalpha() for ch in sub):
+                        continue
+                    total_cnt += 1
+                    if _check_vi_syllable is not None:
+                        if _check_vi_syllable(sub) is None:
+                            valid_cnt += 1
+                    elif not any(ch in "fjwz" for ch in sub.lower()) and len(sub) <= 7:
+                        valid_cnt += 1
+        return float(valid_cnt / total_cnt) if total_cnt > 0 else 0.0
 
-        valid_ratio = valid_cnt / len(alpha_tokens)
-        dia_ratio = min(1.0, dia_tokens / max(1, len(alpha_tokens)) * 1.6)
-        upper_ratio = all_upper_cnt / len(alpha_tokens)
-        # Văn bản lộn ngược thường cho ra tỷ lệ âm tiết hợp lệ thấp hoặc toàn chữ hoa rời rạc
-        score = 0.65 * valid_ratio + 0.35 * (valid_ratio * dia_ratio)
-        if upper_ratio > 0.72 and valid_ratio < 0.75:
-            score *= 0.45
-        return float(max(0.0, min(1.0, score)))
-
-    def score_orientation(self, img: np.ndarray) -> float:
+    def score_orientation(self, img: np.ndarray, text_boxes: list[np.ndarray] | None = None) -> float:
         """
-        Chấm điểm "đọc được" của ảnh ở hướng hiện tại (0..1) bằng mạng `DocumentOrientationResNet`
-        kết hợp kiểm chứng ngữ âm tiếng Việt tổng quát (tuyệt đối không dùng từ khóa mẫu).
+        Tầng 1: Chấm điểm hướng xoay bằng `DocumentOrientationResNet` trên 6 vùng giàu nét chữ
+        đã chuẩn hóa tương phản cục bộ (loại bỏ vùng giấy trắng trống / chữ ký mờ).
         """
-        h, w = img.shape[:2]
-        gray_full = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-
-        # 1. Điểm AI từ DocumentOrientationResNet trên 6 vùng giàu nét chữ đa tỷ lệ (160x160)
-        ai_score = None
         if self.orient_model is not None and torch is not None:
             try:
-                scale_ai = min(1.0, 1400.0 / max(h, w))
-                g_ai = (
-                    cv2.resize(gray_full, None, fx=scale_ai, fy=scale_ai, interpolation=cv2.INTER_AREA)
-                    if scale_ai < 1.0
-                    else gray_full
+                g_norm = self._prepare_contrast_normalized_gray(img, max_side=1400)
+                gh, gw = g_norm.shape[:2]
+                h, w = img.shape[:2]
+                scale_ai = float(gw) / float(max(1, w))
+                grad = np.abs(cv2.Sobel(g_norm, cv2.CV_32F, 1, 0, ksize=3)) + np.abs(
+                    cv2.Sobel(g_norm, cv2.CV_32F, 0, 1, ksize=3)
                 )
-                gh, gw = g_ai.shape[:2]
-                grad = np.abs(cv2.Sobel(g_ai, cv2.CV_32F, 1, 0, ksize=3)) + np.abs(
-                    cv2.Sobel(g_ai, cv2.CV_32F, 0, 1, ksize=3)
-                )
-                cand_patches = []
+                centers: list[tuple[float, float]] = []
+                box_scale = scale_ai
+                active_boxes = text_boxes
+                if active_boxes is None:
+                    cached = getattr(self, "_fast_boxes_cache", None)
+                    if cached is not None and cached[0][0] == img.shape and cached[0][2] == round(float(img[::29, ::29].mean()), 4):
+                        active_boxes = cached[2]
+                        box_scale = float(gw) / float(max(1, cached[1].shape[1]))
+                if active_boxes:
+                    for b in active_boxes:
+                        pts = _order_poly(b) * box_scale
+                        bw = float(max(pts[:, 0]) - min(pts[:, 0]))
+                        bh = float(max(pts[:, 1]) - min(pts[:, 1]))
+                        if bw > 14 and bh > 6:
+                            centers.append((float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1]))))
+
+                cand_patches: list[tuple[float, np.ndarray]] = []
                 for frac in (0.18, 0.26):
                     win = max(120, min(min(gh, gw) - 8, int(min(gh, gw) * frac)))
                     step = max(32, win // 2)
@@ -521,19 +833,23 @@ class OCREngine:
                     x_min, x_max = int(gw * 0.08), max(int(gw * 0.08) + 1, int(gw * 0.88) - win)
                     for yy in range(y_min, y_max + 1, step):
                         for xx in range(x_min, x_max + 1, step):
+                            p_win = g_norm[yy : yy + win, xx : xx + win]
+                            if p_win.size == 0 or float(np.std(p_win)) <= 18.0:
+                                continue
+                            if float(np.mean(p_win < 185)) < 0.02:
+                                continue
                             g_win = grad[yy : yy + win, xx : xx + win]
-                            p_win = g_ai[yy : yy + win, xx : xx + win]
-                            if p_win.size > 0 and float(np.std(p_win)) > 16.0:
-                                cand_patches.append((float(np.mean(g_win)), p_win))
+                            box_hits = sum(1 for cx, cy in centers if xx <= cx <= xx + win and yy <= cy <= yy + win)
+                            rank_score = float(np.mean(g_win)) * (1.0 + 0.25 * min(4, box_hits))
+                            cand_patches.append((rank_score, p_win))
                 cand_patches.sort(key=lambda item: item[0], reverse=True)
                 selected = [p[1] for p in cand_patches[:6]]
                 if not selected:
-                    selected = [cv2.resize(g_ai, (128, 128), interpolation=cv2.INTER_AREA)]
+                    selected = [cv2.resize(g_norm, (128, 128), interpolation=cv2.INTER_AREA)]
                 tensors = []
                 for p in selected:
                     p128 = cv2.resize(p, (128, 128), interpolation=cv2.INTER_AREA)
-                    t = (p128.astype(np.float32) / 255.0 - 0.5) / 0.5
-                    tensors.append(t)
+                    tensors.append((p128.astype(np.float32) / 255.0 - 0.5) / 0.5)
                 batch_t = torch.from_numpy(np.stack(tensors, axis=0)).unsqueeze(1).to(self.typo_device)
                 with torch.inference_mode():
                     logits = self.orient_model(batch_t)
@@ -541,63 +857,66 @@ class OCREngine:
                 p0 = float(probs[:, 0].mean())
                 p2 = float(probs[:, 2].mean())
                 p_side = float((probs[:, 1] + probs[:, 3]).mean())
-                ai_score = p0 / max(1e-4, p0 + p2 + 0.6 * p_side)
+                return float(p0 / max(1e-4, p0 + p2 + 0.6 * p_side))
             except Exception as exc:
                 LOG.debug("DocumentOrientationResNet fallback: %s", exc)
-                ai_score = None
 
-        # 2. Điểm kiểm chứng dòng ngang + ngữ âm tiếng Việt từ OCR
-        phon_score = None
-        if self.ocr_instance is not None:
-            scale = min(1.0, 1100.0 / max(h, w))
-            small = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1.0 else img
-            sh, sw = small.shape[:2]
-            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY) if small.ndim == 3 else small
+        # Fallback nếu thiếu OrientationNet: dùng trực tiếp Tầng 2 trên hướng hiện tại
+        crops = self._extract_readability_line_crops(img, max_lines=4)
+        return float(self._evaluate_crops_readability(crops)["read_score"])
 
-            grad_x = cv2.Sobel(gray, cv2.CV_8U, 1, 0, ksize=3)
-            _, bw = cv2.threshold(grad_x, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(26, sw // 18), 3))
-            closed = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel)
-            contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    def verify_orientation_gate(
+        self,
+        img: np.ndarray,
+        cand_a: int,
+        cand_b: int,
+        tier1_scores: dict[int, float] | None = None,
+    ) -> tuple[int, bool]:
+        """
+        Tầng 2 (OCR Readability Gate): Chạy VietOCR + VietnameseSyllableValidator trên 4-6 dòng chữ
+        tiêu biểu ở cả 2 chiều `cand_a` và `cand_b = (cand_a + 180) % 360`.
+        - Với cặp `0°` vs `180°`: chỉ cho phép xoay `180°` khi chiều `180°` vượt trội rõ rệt về cả
+          `read_score` lẫn tỷ lệ âm tiết tiếng Việt / độ tin cậy VietOCR; ngược lại giữ nguyên `0°`.
+        - Với cặp `90°` vs `270°`: chọn chiều có `read_score` cao hơn rõ rệt.
+        Trả về `(chosen_rotation, verified_by_ocr)`.
+        """
+        if self.ocr_instance is None:
+            return cand_a, False
 
-            horiz_crops = []
-            for cnt in contours:
-                x, y, cw, ch = cv2.boundingRect(cnt)
-                if cw > sw * 0.20 and 10 <= ch <= max(64, sh // 12) and cw > ch * 3.0:
-                    if int(sh * 0.06) <= y <= int(sh * 0.90):
-                        pad_y = max(2, ch // 5)
-                        y1, y2 = max(0, y - pad_y), min(sh, y + ch + pad_y)
-                        x1, x2 = max(0, x), min(sw, x + cw)
-                        crop = small[y1:y2, x1:x2]
-                        if crop.size > 0:
-                            horiz_crops.append((cw, crop))
+        rot_codes = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+        img_a = cv2.rotate(img, rot_codes[cand_a]) if cand_a in rot_codes else img
+        crops_a = self._extract_readability_line_crops(img_a, max_lines=5)
+        if not crops_a:
+            return cand_a, False
 
-            if horiz_crops:
-                horiz_crops.sort(key=lambda item: item[0], reverse=True)
-                top_crops = [c[1] for c in horiz_crops[:3]]
-                if self.viet_recognizer is not None:
-                    pil_samples = []
-                    for c in top_crops:
-                        ch_c, cw_c = c.shape[:2]
-                        new_w = min(440, max(32, int(cw_c * (32.0 / max(1, ch_c)))))
-                        rs = cv2.resize(c, (new_w, 32), interpolation=cv2.INTER_AREA)
-                        pil_samples.append(Image.fromarray(cv2.cvtColor(rs, cv2.COLOR_BGR2RGB)))
-                    if torch is not None:
-                        with torch.inference_mode():
-                            texts = self.viet_recognizer.predict_batch(pil_samples)
-                    else:
-                        texts = self.viet_recognizer.predict_batch(pil_samples)
-                    phon_score = self._vi_syllable_validity_score(texts)
-                else:
-                    rec_res, _ = self.ocr_instance.text_recognizer(top_crops)
-                    confs = [float(conf) for text, conf in (rec_res or []) if len((text or "").strip()) >= 2]
-                    phon_score = float(np.mean(confs)) if confs else 0.0
+        crops_b = [cv2.rotate(c, cv2.ROTATE_180) for c in crops_a]
+        res_a = self._evaluate_crops_readability(crops_a)
+        res_b = self._evaluate_crops_readability(crops_b)
 
-        if ai_score is not None and phon_score is not None:
-            return float(0.72 * ai_score + 0.28 * phon_score)
-        if ai_score is not None:
-            return float(ai_score)
-        return float(phon_score or 0.0)
+        rs_a, vr_a, mc_a = res_a["read_score"], res_a["valid_vi_ratio"], res_a["mean_conf"]
+        rs_b, vr_b, mc_b = res_b["read_score"], res_b["valid_vi_ratio"], res_b["mean_conf"]
+
+        LOG.info(
+            "OCR Readability Gate (%d° vs %d°, n=%d): %d°=[read=%.3f, vi=%.2f, conf=%.2f] | %d°=[read=%.3f, vi=%.2f, conf=%.2f]",
+            cand_a, cand_b, len(crops_a),
+            cand_a, rs_a, vr_a, mc_a,
+            cand_b, rs_b, vr_b, mc_b,
+        )
+
+        if cand_a == 0 and cand_b == 180:
+            allow_flip = (rs_b > rs_a + 0.15 and vr_b > vr_a + 0.15) or (
+                rs_b > rs_a + 0.22 and mc_b > mc_a + 0.25 and vr_b >= vr_a
+            )
+            return (180 if allow_flip else 0), True
+
+        # Cặp 90° vs 270° (hoặc đối xứng 180° khác)
+        if abs(rs_b - rs_a) >= 0.05:
+            return (cand_b if rs_b > rs_a else cand_a), True
+        if abs(mc_b - mc_a) >= 0.06:
+            return (cand_b if mc_b > mc_a else cand_a), True
+        if tier1_scores and cand_a in tier1_scores and cand_b in tier1_scores:
+            return (cand_b if tier1_scores[cand_b] > tier1_scores[cand_a] else cand_a), True
+        return cand_a, False
 
     def _detect_yolo_regions(self, img: np.ndarray, width: int, height: int) -> list[dict]:
         """

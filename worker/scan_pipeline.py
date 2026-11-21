@@ -81,7 +81,13 @@ class ScanPipeline:
                 LOG.warning("Không nạp được RestorationService trong ScanPipeline: %s", exc)
 
         scorer = self.ocr_engine.score_orientation if self.ocr_engine.can_score_orientation else None
-        self.scanner = scanner or DocumentScanner(orientation_scorer=scorer)
+        gate = getattr(self.ocr_engine, "verify_orientation_gate", None) if self.ocr_engine.can_score_orientation else None
+        axis_det = getattr(self.ocr_engine, "detect_text_axis", None) if self.ocr_engine.can_score_orientation else None
+        self.scanner = scanner or DocumentScanner(
+            orientation_scorer=scorer,
+            orientation_gate=gate,
+            axis_detector=axis_det,
+        )
 
     def _ensure_restoration_service(self) -> Any | None:
         if self.restoration_service is None:
@@ -110,18 +116,25 @@ class ScanPipeline:
         u_gray = cv2.cvtColor(unet_restored_bgr, cv2.COLOR_BGR2GRAY) if unet_restored_bgr.ndim == 3 else unet_restored_bgr
         h, w = u_gray.shape[:2]
 
-        soft_norm, _ = preprocessor.soft_normalize_luma(pre_unet_bgr, mode="dilate")
-        stroke_conf, local_drop, _ = preprocessor.compute_stroke_protection(soft_norm, h, w)
+        gray_in = preprocessor.neutralize_highlighter_luma(pre_unet_bgr) if pre_unet_bgr.ndim == 3 else pre_unet_bgr
+        soft_norm, bg_safe = preprocessor.soft_normalize_luma(pre_unet_bgr, mode="dilate")
+        raw_norm = np.clip((gray_in.astype(np.float32) / bg_safe) * 255.0, 0.0, 255.0)
+        bleed_severity = preprocessor.estimate_page_bleed_severity(raw_norm)
+        stroke_conf, local_drop, _ = preprocessor.compute_stroke_protection(
+            soft_norm, h, w, bleed_severity=bleed_severity
+        )
 
         u_f = u_gray.astype(np.float32)
+        drop_ceiling = 8.0 + 14.0 * bleed_severity
         bg_only = (
             np.clip((0.04 - stroke_conf) / 0.04, 0.0, 1.0)
-            * np.clip((8.0 - local_drop) / 8.0, 0.0, 1.0)
+            * np.clip((drop_ceiling - local_drop) / max(8.0, drop_ceiling), 0.0, 1.0)
             * np.clip((soft_norm - 175.0) / 25.0, 0.0, 1.0)
-            * np.clip((228.0 - soft_norm) / 18.0, 0.0, 1.0)
+            * np.clip((232.0 - soft_norm) / 18.0, 0.0, 1.0)
             * np.clip((u_f - 242.0) / 12.0, 0.0, 1.0)
         )
-        soft_target = np.clip(soft_norm + 0.45 * np.maximum(0.0, u_f - soft_norm), 0.0, 252.0)
+        blend_w = 0.45 + 0.50 * bleed_severity
+        soft_target = np.clip(soft_norm + blend_w * np.maximum(0.0, u_f - soft_norm), 0.0, 255.0)
         ocr_gray = np.clip((1.0 - bg_only) * soft_norm + bg_only * soft_target, 0.0, 255.0).astype(np.uint8)
         return cv2.cvtColor(ocr_gray, cv2.COLOR_GRAY2BGR)
 
@@ -150,20 +163,26 @@ class ScanPipeline:
             conf = 1.0
             corners_list = None
 
-            rotation = self.scanner.orient(warped_img)
+            if hasattr(self.scanner, "orient_with_verification"):
+                rotation, orientation_verified = self.scanner.orient_with_verification(warped_img)
+            else:
+                rotation = self.scanner.orient(warped_img)
+                orientation_verified = False
             if rotation:
                 rh, rw = warped_img.shape[:2]
                 warp_transform = rotation_matrix(rotation, rw, rh) @ warp_transform
                 warped_img = rotate_image(warped_img, rotation)
 
             try:
-                warped_img = self.preprocessor.clean_handwriting_and_book_gutter(warped_img)
+                warped_img = self.preprocessor.clean_handwriting_and_book_gutter(
+                    warped_img, remove_colored_pen=False
+                )
             except Exception as exc:
-                LOG.warning("Lỗi khi lọc chữ viết tay / gáy sách: %s", exc)
+                LOG.warning("Lỗi khi lọc rãnh gáy sách: %s", exc)
 
             LOG.info(
-                "  [ScanPipeline] method=%s conf=%.2f rotation=%d° (%dx%d -> %dx%d)",
-                method, conf, rotation, w, h, warped_img.shape[1], warped_img.shape[0],
+                "  [ScanPipeline] method=%s conf=%.2f rotation=%d° verified=%s (%dx%d -> %dx%d)",
+                method, conf, rotation, orientation_verified, w, h, warped_img.shape[1], warped_img.shape[0],
             )
             geometry = ScanGeometry(
                 image=warped_img,
@@ -173,6 +192,7 @@ class ScanPipeline:
                 detection_confidence=conf,
                 corners=corners_list,
                 rotation=rotation,
+                orientation_verified=orientation_verified,
             )
         else:
             geometry = ScanGeometry(image=img, transform=np.eye(3), original_size=(w, h), method="disabled")

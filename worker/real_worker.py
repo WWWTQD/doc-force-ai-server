@@ -270,10 +270,10 @@ def _upload_restored(job_id: str, page_id: str, lease_token: str, image_bytes: b
     return None
 
 
-def _sync_to_docker_backend(local_path: str, storage_key: str):
+def _sync_to_docker_backend(local_path: str, storage_key: str, label: str = "restored image"):
     """
     Nếu Spring Boot Backend đang chạy trong Docker container (ceabf1005847 / pbl4-doc_forge-backend-app-1),
-    sao chép trực tiếp file ảnh đã phục hồi vào /data/storage của container để frontend tải được ảnh sạch.
+    sao chép trực tiếp file ảnh vào /data/storage của container để frontend tải được ảnh mới.
     """
     container_names = ["pbl4-doc_forge-backend-app-1", "docforge-app"]
     dest_dir = "/data/storage/" + "/".join(storage_key.split("/")[:-1])
@@ -289,7 +289,7 @@ def _sync_to_docker_backend(local_path: str, storage_key: str):
             dest_file = f"{cname}:/data/storage/{storage_key}"
             res = subprocess.run(["docker", "cp", local_path, dest_file], capture_output=True, timeout=5)
             if res.returncode == 0:
-                LOG.info("  ✓ Đã đồng bộ restored image vào Docker backend (%s): %s", cname, storage_key)
+                LOG.info("  ✓ Đã đồng bộ %s vào Docker backend (%s): %s", label, cname, storage_key)
                 return True
         except Exception:
             pass
@@ -422,7 +422,11 @@ def _process_ocr_job(job: dict, pipeline: ScanPipeline):
 
             # Upload ảnh phục hồi lên Backend (/restored) hoặc ghi trực tiếp vào SHARED_STORAGE_ROOT (/data/storage)
             restored_key = _save_restored_image(job, page_id, result.restored_image)
-            if result.geometry.rotation in (90, 180, 270) and job.get("documentId"):
+            if (
+                result.geometry.rotation in (90, 180, 270)
+                and getattr(result.geometry, "orientation_verified", False)
+                and job.get("documentId")
+            ):
                 try:
                     ok_orig, enc_orig = cv2.imencode(".jpg", result.geometry.image, [int(cv2.IMWRITE_JPEG_QUALITY), 98])
                     if ok_orig:
@@ -438,7 +442,7 @@ def _process_ocr_job(job: dict, pipeline: ScanPipeline):
                             tmp_orig = os.path.join(tempfile.gettempdir(), f"rotated_orig_{page_id}.jpg")
                             with open(tmp_orig, "wb") as f_orig:
                                 f_orig.write(orig_bytes)
-                            _sync_to_docker_backend(tmp_orig, orig_key)
+                            _sync_to_docker_backend(tmp_orig, orig_key, label="ảnh gốc đã xoay")
                         rh, rw = result.restored_image.shape[:2]
                         subprocess.run(
                             [

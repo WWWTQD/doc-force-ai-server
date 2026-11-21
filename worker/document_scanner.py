@@ -47,6 +47,7 @@ class ScanGeometry:
     detection_confidence: float = 0.0
     corners: list[list[float]] | None = None  # TL, TR, BR, BL trong ảnh gốc
     rotation: int = 0  # góc đã xoay theo chiều kim đồng hồ (0/90/180/270)
+    orientation_verified: bool = False  # True nếu góc xoay đã qua Tầng 2 OCR Readability Gate
     notes: list[str] = field(default_factory=list)
 
     def to_metadata(self) -> dict:
@@ -55,6 +56,7 @@ class ScanGeometry:
             "detectionConfidence": round(float(self.detection_confidence), 3),
             "corners": [[round(float(x), 1), round(float(y), 1)] for x, y in self.corners] if self.corners else None,
             "rotation": self.rotation,
+            "orientationVerified": self.orientation_verified,
             "originalWidth": self.original_size[0],
             "originalHeight": self.original_size[1],
         }
@@ -182,11 +184,15 @@ class DocumentScanner:
         snap_a4: bool = True,
         max_output_side: int = 3000,
         orientation_scorer: Callable[[np.ndarray], float] | None = None,
+        orientation_gate: Callable[[np.ndarray, int, int, dict[int, float]], tuple[int, bool]] | None = None,
+        axis_detector: Callable[[np.ndarray], str] | None = None,
     ):
         self.conf_threshold = conf_threshold
         self.snap_a4 = snap_a4
         self.max_output_side = max_output_side
         self.orientation_scorer = orientation_scorer
+        self.orientation_gate = orientation_gate
+        self.axis_detector = axis_detector
         self.model = None
 
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -282,35 +288,99 @@ class DocumentScanner:
                                      borderMode=cv2.BORDER_REPLICATE)
         return warped, matrix.astype(np.float64)
 
-    # ── Bước 3: xoay đúng chiều ──────────────────────────────────────────────
-    def orient(self, img: np.ndarray) -> int:
-        """Trả về góc cần xoay theo chiều kim đồng hồ (0/90/180/270)."""
+    # ── Bước 3: xoay đúng chiều (2 tầng: OrientationNet Prior Bias + OCR Readability Gate) ──
+    def orient_with_verification(self, img: np.ndarray) -> tuple[int, bool]:
+        """
+        Trả về `(rotation_deg, verified_by_ocr_gate)` theo chiều kim đồng hồ (0/90/180/270).
+        - Tầng 1: Xác định trục chữ (ngang vs dọc) + chấm điểm bằng `OrientationNet` (ưu tiên 0° khi
+          chênh lệch nhỏ `|s180 - s0| < 0.20` hoặc `s180 < 0.65`).
+        - Tầng 2 (`orientation_gate`): Bắt buộc kiểm chứng bằng VietOCR + VietnameseSyllableValidator
+          trên 4-6 dòng chữ mỗi khi đề xuất xoay 180°, khi margin 0°/180° < 0.25, hoặc cho cặp 90°/270°.
+        """
         h, w = img.shape[:2]
-        if text_axis_is_vertical(img):
+        axis = self.axis_detector(img) if self.axis_detector is not None else "ambiguous"
+        if axis == "vertical":
+            candidates = [90, 270]
+        elif axis == "horizontal":
+            candidates = [0, 180]
+        elif text_axis_is_vertical(img):
             candidates = [90, 270]
         elif w > h * 1.1:
-            candidates = [90, 270, 0]
+            candidates = [0, 90, 270]
         else:
             candidates = [0, 180]
 
-        if self.orientation_scorer is None:
-            return candidates[0]
+        if self.orientation_scorer is None and self.orientation_gate is None:
+            return candidates[0], False
 
         try:
-            scores = {}
-            best_rot = candidates[0]
-            best_score = -1.0
-            for cand in candidates:
-                sc = self.orientation_scorer(rotate_image(img, cand))
-                scores[cand] = sc
-                if sc > best_score:
-                    best_score = sc
-                    best_rot = cand
-            LOG.info("Orientation score: %s -> chọn %d°", {k: round(v, 3) for k, v in scores.items()}, best_rot)
-            return best_rot
+            scores: dict[int, float] = {}
+            if self.orientation_scorer is not None:
+                for cand in candidates:
+                    scores[cand] = float(self.orientation_scorer(rotate_image(img, cand)))
+
+            # Nhánh 1: Tài liệu chữ ngang (0° vs 180°)
+            if set(candidates) == {0, 180}:
+                s0 = scores.get(0, 0.5)
+                s180 = scores.get(180, 0.0)
+                tier1_proposes_180 = (s180 >= 0.65) and ((s180 - s0) >= 0.20)
+                need_gate = (s180 > s0) or (abs(s180 - s0) < 0.25) or (max(s0, s180) < 0.65)
+                if self.orientation_gate is not None and need_gate:
+                    chosen, verified = self.orientation_gate(img, 0, 180, scores)
+                else:
+                    chosen = 180 if tier1_proposes_180 else 0
+                    verified = not need_gate
+                LOG.info(
+                    "Orientation score: %s -> chọn %d° (verified=%s)",
+                    {k: round(v, 3) for k, v in scores.items()},
+                    chosen,
+                    verified,
+                )
+                return chosen, verified
+
+            # Nhánh 2: Tài liệu chữ dọc (90° vs 270°)
+            if set(candidates) == {90, 270}:
+                if self.orientation_gate is not None:
+                    chosen, verified = self.orientation_gate(img, 90, 270, scores)
+                else:
+                    s90 = scores.get(90, 0.5)
+                    s270 = scores.get(270, 0.0)
+                    chosen, verified = (90 if s90 >= s270 else 270), False
+                LOG.info(
+                    "Orientation score: %s -> chọn %d° (verified=%s)",
+                    {k: round(v, 3) for k, v in scores.items()},
+                    chosen,
+                    verified,
+                )
+                return chosen, verified
+
+            # Nhánh 3: Khung ngang mơ hồ (0° vs 90° vs 270°)
+            best_rot = max(scores, key=scores.get) if scores else 0
+            verified = False
+            if self.orientation_gate is not None and best_rot in (90, 270):
+                chosen_side, ver_side = self.orientation_gate(img, 90, 270, scores)
+                chosen_0, ver_0 = self.orientation_gate(img, 0, 180, {0: scores.get(0, 0.5), 180: 0.0})
+                # Chỉ xoay ngang nếu thực sự 0° không đọc được
+                if ver_0 and scores.get(0, 0.0) >= 0.40:
+                    chosen, verified = chosen_0, ver_0
+                else:
+                    chosen, verified = chosen_side, ver_side
+            else:
+                chosen = best_rot
+            LOG.info(
+                "Orientation score: %s -> chọn %d° (verified=%s)",
+                {k: round(v, 3) for k, v in scores.items()},
+                chosen,
+                verified,
+            )
+            return chosen, verified
         except Exception as exc:
             LOG.warning("Orientation scorer lỗi: %s — giữ hướng %d°", exc, candidates[0])
-            return candidates[0]
+            return candidates[0], False
+
+    def orient(self, img: np.ndarray) -> int:
+        """Trả về góc cần xoay theo chiều kim đồng hồ (0/90/180/270)."""
+        return self.orient_with_verification(img)[0]
 
     # ── Toàn bộ pipeline ─────────────────────────────────────────────────────
     def scan(self, img: np.ndarray, auto_rotate: bool = True) -> ScanGeometry:
@@ -330,12 +400,13 @@ class DocumentScanner:
         geometry.detection_confidence = conf
 
         if auto_rotate:
-            rotation = self.orient(geometry.image)
+            rotation, verified = self.orient_with_verification(geometry.image)
             if rotation:
                 rh, rw = geometry.image.shape[:2]
                 geometry.transform = rotation_matrix(rotation, rw, rh) @ geometry.transform
                 geometry.image = rotate_image(geometry.image, rotation)
             geometry.rotation = rotation
+            geometry.orientation_verified = verified
 
         LOG.info("Scan: method=%s conf=%.2f rotation=%d° -> %dx%d", geometry.method, conf,
                  geometry.rotation, geometry.image.shape[1], geometry.image.shape[0])
